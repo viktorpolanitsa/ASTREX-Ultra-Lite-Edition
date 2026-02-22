@@ -1,0 +1,99 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ASTREX v3.0 — Requirements
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CORE (Required)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# PDF extraction
+pypdf>=3.0.0
+
+# Character encoding detection
+chardet>=5.0.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EXTRACTORS (Optional but recommended)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Legacy Office (DOC, XLS, PPT)
+olefile>=0.46
+
+# RTF
+striprtf>=0.0.26
+
+# Email MSG
+extract-msg>=0.45.0
+
+# RAR archives
+rarfile>=4.0
+
+# 7z archives
+py7zr>=0.20.0
+
+# HTML parsing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NLP (Optional - enables advanced analysis)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Russian morphology
+pymorphy2>=0.9.1
+pymorphy2-dicts-ru>=2.4.0
+
+# Fuzzy search
+rapidfuzz>=3.0.0
+
+# spaCy (Python < 3.14 only)
+# spacy>=3.5.0
+
+# Sentence embeddings
+sentence-transformers>=2.2.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VECTOR STORE (Optional - enables semantic search)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ChromaDB vector database
+chromadb>=0.4.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEB API (Optional - enables REST API)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# FastAPI framework
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GPU ACCELERATION (Optional)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# PyTorch — раскомментируйте ОДНУ строку под ваше железо:
+# pip install torch torchvision torchaudio                                     # CPU only
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118   # NVIDIA CUDA 11.8
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124   # NVIDIA CUDA 12.4
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2 # AMD ROCm 6.2
+
+# Intel Arc / iGPU (установите PyTorch XPU):
+# pip install torch torchvision torchaudio --index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+# pip install intel-extension-for-pytorch          # Intel IPEX для XPU
+
+# Intel OpenVINO (альтернатива для iGPU без IPEX):
+# pip install openvino>=2023.0.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DEVELOPMENT (Optional)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Testing
+# pytest>=7.0.0
+# pytest-asyncio>=0.21.0
+
+# Type checking
+# mypy>=1.0.0
+
+# Linting
+# ruff>=0.1.0
