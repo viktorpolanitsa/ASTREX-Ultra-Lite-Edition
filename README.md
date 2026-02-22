@@ -39,4 +39,4 @@ ASTREX — это проприетарная высокопроизводите�
 Шаг 1. Получение файлов системы
 Скачайте архив с проектом (кнопка Code -> Download ZIP в репозитории) или склонируйте его через терминал:
 `bash
-git clone [https://github.com/Ваш_Репозиторий/Astrex-Ultra-Lite.git](https://github.com/Ваш_Репозиторий/Astrex-Ultra-Lite.git)
+git clone https://github.com/viktorpolanitsa/ASTREX-Ultra-Lite-Edition.git
