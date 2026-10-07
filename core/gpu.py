@@ -4,6 +4,7 @@ ASTREX v3.0 — GPU Detection & Management
 Обнаружение и управление GPU/iGPU ускорением
 """
 
+import importlib.util
 import logging
 import threading
 from dataclasses import dataclass
@@ -19,169 +20,151 @@ class GPUDevice:
     backend: str          # "cuda", "rocm", "xpu", "mps", "openvino", "cpu"
     device_id: int = 0
     memory_total: int = 0  # MB
-    memory_free: int = 0   # MB
+    memory_free: int = 0   # MB (0 — неизвестно)
 
     @property
     def torch_device(self) -> str:
-        if self.backend == "cuda":
-            return f"cuda:{self.device_id}"
-        if self.backend == "rocm":
-            return f"cuda:{self.device_id}"  # ROCm uses cuda API in PyTorch
+        """Строка устройства для PyTorch (OpenVINO для torch недоступен → cpu)."""
+        if self.backend in ("cuda", "rocm"):
+            return f"cuda:{self.device_id}"  # ROCm использует CUDA API в PyTorch
         if self.backend == "xpu":
             return f"xpu:{self.device_id}"
         if self.backend == "mps":
             return "mps"
         return "cpu"
 
+    @property
+    def usable_by_torch(self) -> bool:
+        return self.backend in ("cuda", "rocm", "xpu", "mps")
 
-def _detect_cuda() -> List[GPUDevice]:
-    """Обнаружение NVIDIA CUDA GPU"""
-    devices = []
+
+def _torch_installed() -> bool:
+    return importlib.util.find_spec("torch") is not None
+
+
+def _detect_torch_cuda() -> List[GPUDevice]:
+    """NVIDIA CUDA или AMD ROCm (ROCm-сборки PyTorch тоже отвечают через torch.cuda).
+
+    Используются только свойства устройства — без mem_get_info(), который
+    создаёт CUDA-контекст (~300 МБ видеопамяти) ради одной строки статуса.
+    """
+    devices: List[GPUDevice] = []
     try:
         import torch
-        if torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(i)
-                free, total = torch.cuda.mem_get_info(i)
-                devices.append(GPUDevice(
-                    name=props.name,
-                    backend="cuda",
-                    device_id=i,
-                    memory_total=total // (1024 * 1024),
-                    memory_free=free // (1024 * 1024),
-                ))
-    except (ImportError, Exception):
-        pass
-    return devices
-
-
-def _detect_rocm() -> List[GPUDevice]:
-    """Обнаружение AMD ROCm GPU"""
-    devices = []
-    try:
-        import torch
-        # ROCm builds report as cuda in PyTorch
-        if hasattr(torch.version, 'hip') and torch.version.hip and torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(i)
-                free, total = torch.cuda.mem_get_info(i)
-                devices.append(GPUDevice(
-                    name=props.name,
-                    backend="rocm",
-                    device_id=i,
-                    memory_total=total // (1024 * 1024),
-                    memory_free=free // (1024 * 1024),
-                ))
-    except (ImportError, Exception):
-        pass
+        if not torch.cuda.is_available():
+            return devices
+        backend = "rocm" if getattr(torch.version, 'hip', None) else "cuda"
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            devices.append(GPUDevice(
+                name=props.name,
+                backend=backend,
+                device_id=i,
+                memory_total=int(props.total_memory) // (1024 * 1024),
+            ))
+    except Exception as e:
+        logger.debug(f"CUDA/ROCm detection failed: {e}")
     return devices
 
 
 def _detect_xpu() -> List[GPUDevice]:
-    """Обнаружение Intel Arc/iGPU (XPU) через intel-extension-for-pytorch"""
-    devices = []
+    """Intel Arc/iGPU (XPU): нативно в PyTorch ≥ 2.4 или через IPEX."""
+    devices: List[GPUDevice] = []
     try:
         import torch
-        import intel_extension_for_pytorch as ipex
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
-            for i in range(torch.xpu.device_count()):
-                name = torch.xpu.get_device_name(i)
-                try:
-                    props = torch.xpu.get_device_properties(i)
-                    total = getattr(props, 'total_memory', 0) // (1024 * 1024)
-                except Exception:
-                    total = 0
-                devices.append(GPUDevice(
-                    name=name,
-                    backend="xpu",
-                    device_id=i,
-                    memory_total=total,
-                    memory_free=0,
-                ))
-    except (ImportError, Exception):
-        pass
+        if not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+            try:
+                import intel_extension_for_pytorch  # noqa: F401  (регистрирует torch.xpu)
+            except ImportError:
+                return devices
+            if not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
+                return devices
+        for i in range(torch.xpu.device_count()):
+            name = torch.xpu.get_device_name(i)
+            try:
+                props = torch.xpu.get_device_properties(i)
+                total = int(getattr(props, 'total_memory', 0)) // (1024 * 1024)
+            except Exception:
+                total = 0
+            devices.append(GPUDevice(name=name, backend="xpu", device_id=i, memory_total=total))
+    except Exception as e:
+        logger.debug(f"XPU detection failed: {e}")
     return devices
 
 
 def _detect_openvino() -> List[GPUDevice]:
-    """Обнаружение Intel GPU через OpenVINO"""
-    devices = []
+    """Intel GPU через OpenVINO (информационно: PyTorch его не использует)."""
+    devices: List[GPUDevice] = []
+    if importlib.util.find_spec("openvino") is None:
+        return devices
     try:
-        # openvino >= 2025: импорт напрямую из openvino (openvino.runtime deprecated)
         try:
             from openvino import Core
         except ImportError:
             from openvino.runtime import Core
 
         core = Core()
-        available = core.available_devices
-        for dev in available:
+        for idx, dev in enumerate(core.available_devices):
             if dev.startswith("GPU"):
                 name = core.get_property(dev, "FULL_DEVICE_NAME")
-                devices.append(GPUDevice(
-                    name=name,
-                    backend="openvino",
-                    device_id=0,
-                ))
-    except (ImportError, Exception):
-        pass
+                devices.append(GPUDevice(name=name, backend="openvino", device_id=idx))
+    except Exception as e:
+        logger.debug(f"OpenVINO detection failed: {e}")
     return devices
 
 
 def _detect_mps() -> List[GPUDevice]:
     """Обнаружение Apple Metal (macOS)"""
-    devices = []
+    devices: List[GPUDevice] = []
     try:
         import torch
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            devices.append(GPUDevice(
-                name="Apple Metal GPU",
-                backend="mps",
-                device_id=0,
-            ))
-    except (ImportError, Exception):
-        pass
+            devices.append(GPUDevice(name="Apple Metal GPU", backend="mps"))
+    except Exception as e:
+        logger.debug(f"MPS detection failed: {e}")
     return devices
 
 
-def detect_all_gpus() -> List[GPUDevice]:
-    """Обнаружить все доступные GPU/iGPU ускорители"""
-    all_devices: List[GPUDevice] = []
+_detected: Optional[List[GPUDevice]] = None
+_detect_lock = threading.Lock()
 
-    # NVIDIA CUDA
-    cuda = _detect_cuda()
-    # Проверяем, что это именно CUDA, а не ROCm
-    rocm = _detect_rocm()
-    if rocm:
-        all_devices.extend(rocm)
-    elif cuda:
-        all_devices.extend(cuda)
 
-    # Intel XPU (Arc / iGPU)
-    all_devices.extend(_detect_xpu())
+def detect_all_gpus(force_refresh: bool = False) -> List[GPUDevice]:
+    """Обнаружить все доступные GPU/iGPU ускорители (результат кешируется)."""
+    global _detected
+    with _detect_lock:
+        if _detected is not None and not force_refresh:
+            return list(_detected)
 
-    # Intel OpenVINO (fallback для iGPU без IPEX)
-    if not any(d.backend == "xpu" for d in all_devices):
-        all_devices.extend(_detect_openvino())
-
-    # Apple Metal
-    all_devices.extend(_detect_mps())
-
-    return all_devices
+        devices: List[GPUDevice] = []
+        if _torch_installed():
+            devices.extend(_detect_torch_cuda())
+            devices.extend(_detect_xpu())
+            devices.extend(_detect_mps())
+        devices.extend(_detect_openvino())
+        _detected = devices
+        return list(devices)
 
 
 def get_best_device() -> GPUDevice:
-    """Выбрать лучший доступный ускоритель.
+    """Выбрать лучший ускоритель, который реально может использовать PyTorch.
 
-    Приоритет: CUDA/ROCm > XPU > MPS > OpenVINO > CPU
+    Приоритет: CUDA/ROCm > XPU > MPS > CPU. OpenVINO-устройства показываются
+    в статусе, но вычисления моделей (sentence-transformers) идут на CPU.
     """
-    devices = detect_all_gpus()
+    from .config import NLP_CONFIG
+
+    devices = [d for d in detect_all_gpus() if d.usable_by_torch]
+    backend = (NLP_CONFIG.gpu_backend or "auto").lower()
+    if backend not in ("auto", ""):
+        if backend == "cpu":
+            return GPUDevice(name="CPU", backend="cpu")
+        devices = [d for d in devices if d.backend == backend]
 
     if not devices:
         return GPUDevice(name="CPU", backend="cpu")
 
-    # Сортируем: дискретные GPU первые (больше памяти = лучше)
-    priority = {"cuda": 0, "rocm": 0, "xpu": 1, "mps": 2, "openvino": 3}
+    priority = {"cuda": 0, "rocm": 0, "xpu": 1, "mps": 2}
     devices.sort(key=lambda d: (priority.get(d.backend, 99), -d.memory_total))
 
     best = devices[0]
@@ -191,10 +174,7 @@ def get_best_device() -> GPUDevice:
 
 def get_torch_device_string() -> str:
     """Получить строку устройства PyTorch для использования в моделях"""
-    from .config import NLP_CONFIG
-    if not NLP_CONFIG.use_gpu:
-        return "cpu"
-    return get_best_device().torch_device
+    return get_device().torch_device
 
 
 # Кешированный результат определения GPU
@@ -211,11 +191,10 @@ def get_device(force_refresh: bool = False) -> GPUDevice:
     if _cached_device is not None and not force_refresh:
         return _cached_device
     with _cached_device_lock:
-        # Double-check inside lock
         if _cached_device is not None and not force_refresh:
             return _cached_device
         from .config import NLP_CONFIG
-        if not NLP_CONFIG.use_gpu:
+        if not NLP_CONFIG.use_gpu or not _torch_installed():
             _cached_device = GPUDevice(name="CPU", backend="cpu")
         else:
             _cached_device = get_best_device()
@@ -226,11 +205,10 @@ def get_device(force_refresh: bool = False) -> GPUDevice:
                     import torch
                     fraction = NLP_CONFIG.gpu_memory_fraction
                     if 0 < fraction < 1.0:
-                        for i in range(torch.cuda.device_count()):
-                            torch.cuda.set_per_process_memory_fraction(fraction, i)
-                            logger.info(
-                                f"GPU {i}: memory limited to {fraction*100:.0f}%"
-                            )
+                        torch.cuda.set_per_process_memory_fraction(fraction, _cached_device.device_id)
+                        logger.info(
+                            f"GPU {_cached_device.device_id}: memory limited to {fraction*100:.0f}%"
+                        )
                 except Exception as e:
                     logger.debug(f"Could not limit GPU memory: {e}")
 
@@ -246,7 +224,8 @@ def gpu_info_dict() -> dict:
         "active_backend": active.backend,
         "active_torch_device": active.torch_device,
         "all_devices": [
-            {"name": d.name, "backend": d.backend, "memory_mb": d.memory_total}
+            {"name": d.name, "backend": d.backend, "memory_mb": d.memory_total,
+             "usable_by_torch": d.usable_by_torch}
             for d in devices
         ],
     }

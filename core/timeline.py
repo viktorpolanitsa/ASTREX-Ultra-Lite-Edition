@@ -100,30 +100,47 @@ def parse_date(text: str) -> Optional[date]:
 def extract_dates_from_text(text: str, max_dates: int = 200) -> List[Tuple[date, str, int]]:
     """Извлечь все даты из текста с контекстом.
 
+    Совпадения разных шаблонов, вложенные друг в друга ("марта 2024" внутри
+    "15 марта 2024"), отбрасываются — иначе появлялось ложное событие
+    "1 марта". Одна и та же дата в разных местах документа даёт разные
+    события, но повторы в пределах ±200 символов объединяются.
+
     Returns:
         Список (дата, контекст, позиция)
     """
-    results = []
-    seen = set()
-
-    for pattern, fmt in _DATE_PATTERNS:
-        for m in pattern.finditer(text[:100_000]):
+    sample = text[:100_000]
+    candidates: List[Tuple[int, int, date]] = []
+    for pattern, _fmt in _DATE_PATTERNS:
+        for m in pattern.finditer(sample):
             d = parse_date(m.group(0))
-            if d and d not in seen:
-                # Reasonable date range
-                if 1900 <= d.year <= 2100:
-                    seen.add(d)
-                    # Context: ±100 chars around match
-                    start = max(0, m.start() - 100)
-                    end = min(len(text), m.end() + 100)
-                    ctx = text[start:end].strip().replace('\n', ' ')
-                    results.append((d, ctx, m.start()))
-            if len(results) >= max_dates:
-                break  # exit inner (finditer) loop
-        if len(results) >= max_dates:
-            break  # exit outer (pattern) loop
+            if d and 1900 <= d.year <= 2100:
+                candidates.append((m.start(), m.end(), d))
 
-    results.sort(key=lambda x: x[0])
+    # Предпочитаем более длинные (конкретные) совпадения, вложенные — убираем
+    candidates.sort(key=lambda c: (-(c[1] - c[0]), c[0]))
+    taken: List[Tuple[int, int]] = []
+    accepted: List[Tuple[int, int, date]] = []
+    for start, end, d in candidates:
+        if any(start < t_end and end > t_start for t_start, t_end in taken):
+            continue
+        taken.append((start, end))
+        accepted.append((start, end, d))
+    accepted.sort(key=lambda c: c[0])
+
+    results = []
+    last_pos: Dict[date, int] = {}
+    for start, end, d in accepted:
+        if d in last_pos and start - last_pos[d] < 200:
+            continue
+        last_pos[d] = start
+        ctx_start = max(0, start - 100)
+        ctx_end = min(len(text), end + 100)
+        ctx = text[ctx_start:ctx_end].strip().replace('\n', ' ')
+        results.append((d, ctx, start))
+        if len(results) >= max_dates:
+            break
+
+    results.sort(key=lambda x: (x[0], x[2]))
     return results
 
 
@@ -225,14 +242,14 @@ class TimelineBuilder:
 
 def _classify_event(context: str) -> str:
     """Классифицировать событие по контексту"""
-    ctx = context.lower()
-    if any(w in ctx for w in ('договор', 'контракт', 'соглашение', 'подписан')):
+    ctx = context.lower().replace('ё', 'е')
+    if any(w in ctx for w in ('договор', 'контракт', 'соглашени', 'подписан')):
         return "agreement"
-    if any(w in ctx for w in ('оплат', 'перевод', 'сумм', 'рублей', 'долларов', 'платёж')):
+    if any(w in ctx for w in ('оплат', 'перевод', 'сумм', 'рубл', 'доллар', 'платеж')):
         return "transaction"
-    if any(w in ctx for w in ('встреча', 'совещание', 'заседание', 'собрание')):
+    if any(w in ctx for w in ('встреч', 'совещани', 'заседани', 'собрани')):
         return "meeting"
-    if any(w in ctx for w in ('создан', 'зарегистрирован', 'основан', 'учреждён')):
+    if any(w in ctx for w in ('создан', 'зарегистрирован', 'основан', 'учрежден')):
         return "created"
     if any(w in ctx for w in ('родил', 'дата рождения')):
         return "birth"

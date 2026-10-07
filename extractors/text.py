@@ -5,16 +5,67 @@ Plaintext, code, config files with encoding detection
 """
 
 import csv
-import mmap
-import os
+import html as html_module
+import json
+import re
+import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
-from .base import BaseExtractor, ExtractionResult, registry
+from .base import BaseExtractor, ExtractionResult, TextCollector, registry
 from core.config import ENGINE_CONFIG, FILE_TYPES
+from core.encoding import decode_bytes, detect_encoding, is_probably_binary
 
-# Устанавливаем лимит один раз при загрузке модуля, а не при каждом вызове extract()
-csv.field_size_limit(1024 * 1024)  # 1MB per field max
+# Поля CSV бывают большими (текст писем в выгрузках); лимит задаётся один раз
+csv.field_size_limit(min(sys.maxsize, 64 * 1024 * 1024))
+
+
+def _byte_budget() -> int:
+    """Сколько байт читать, чтобы получить ~max_extracted_chars символов."""
+    return min(ENGINE_CONFIG.chunk_size, ENGINE_CONFIG.max_extracted_chars * 4)
+
+
+def read_text_file(path: Path, max_bytes: Optional[int] = None) -> Tuple[str, str, bool]:
+    """Прочитать текстовый файл с определением кодировки.
+
+    Для файлов больше лимита читается начало (~80%) и конец (~20%).
+    Разрез посередине многобайтового символа UTF-8 не ломает
+    определение кодировки.
+
+    Returns:
+        (текст, кодировка, был ли текст обрезан)
+    """
+    if max_bytes is None:
+        max_bytes = _byte_budget()
+    size = path.stat().st_size
+
+    with open(path, 'rb') as f:
+        if size <= max_bytes:
+            raw = f.read()
+            text, encoding = decode_bytes(raw)
+            return text, encoding, False
+
+        head_size = int(max_bytes * 0.8)
+        tail_size = max_bytes - head_size
+        head_size -= head_size % 4  # выравнивание для UTF-16/32
+        tail_size -= tail_size % 4
+        head = f.read(head_size)
+        f.seek(size - tail_size)
+        tail = f.read(tail_size)
+
+    encoding, _ = detect_encoding(head, final=False)
+    if encoding == 'utf-8-sig':
+        encoding = 'utf-8'
+        head = head[3:]
+    head_text, _ = decode_bytes(head, declared=encoding, final=False)
+    tail_text = tail.decode(encoding, errors='replace') if encoding else ''
+    # Отбрасываем начало хвоста до первого перевода строки (возможен обрезанный символ)
+    nl = tail_text.find('\n')
+    if 0 <= nl < 4096:
+        tail_text = tail_text[nl + 1:]
+    skipped = size - head_size - tail_size
+    text = f"{head_text}\n\n[...пропущено {skipped} байт...]\n\n{tail_text}"
+    return text, encoding, True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -24,356 +75,246 @@ csv.field_size_limit(1024 * 1024)  # 1MB per field max
 @registry.register
 class PlainTextExtractor(BaseExtractor):
     """Извлечение из текстовых файлов с определением кодировки"""
-    
+
     extensions = list(FILE_TYPES.TEXT | FILE_TYPES.CODE | FILE_TYPES.DATA)
     priority = 100  # Lowest priority - fallback for text files
-    
+
     @classmethod
     def is_available(cls) -> bool:
         return True
-    
+
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
             file_size = path.stat().st_size
-            
+
             if file_size == 0:
                 return ExtractionResult(text="", metadata={'empty': True})
-            
-            # For large files, use mmap
-            if file_size > ENGINE_CONFIG.chunk_size:
-                return cls._extract_large_file(path, file_size)
-            
-            # Normal extraction with encoding detection
-            text, encoding = cls._read_with_encoding(path)
-            
-            if text is not None:
-                return ExtractionResult(
-                    text=text,
-                    metadata={
-                        'encoding': encoding,
-                        'size': file_size,
-                        'lines': text.count('\n') + 1
-                    }
-                )
-            
-            return ExtractionResult(error="Could not decode file with any supported encoding")
-            
+
+            with open(path, 'rb') as f:
+                sample = f.read(8192)
+            if is_probably_binary(sample):
+                # .dat/.ts и т.п. часто бывают двоичными (видео MPEG-TS, дампы):
+                # это не ошибка, текста просто нет
+                return ExtractionResult(text='', metadata={'binary': True, 'size': file_size,
+                                                           'skipped': 'binary content'})
+
+            text, encoding, truncated = read_text_file(path)
+            return ExtractionResult(
+                text=text,
+                metadata={
+                    'encoding': encoding,
+                    'size': file_size,
+                    'lines': text.count('\n') + 1,
+                    'truncated': truncated,
+                }
+            )
+
         except Exception as e:
             return ExtractionResult(error=f"Text extraction failed: {e}")
-    
+
     @classmethod
     def _read_with_encoding(cls, path: Path, max_bytes: int = 0) -> Tuple[Optional[str], Optional[str]]:
-        """Чтение файла с автоопределением кодировки.
-
-        Args:
-            max_bytes: максимум байт для чтения (0 = без лимита, но не более chunk_size)
-        """
-        if max_bytes <= 0:
-            max_bytes = ENGINE_CONFIG.chunk_size  # 64MB safety cap
-
-        file_size = path.stat().st_size
-        read_limit = min(file_size, max_bytes)
-
-        # Try chardet first if available
+        """Совместимость: чтение файла с автоопределением кодировки."""
         try:
-            import chardet
-
-            with open(path, 'rb') as f:
-                raw = f.read(65536)  # First 64KB for detection
-
-            detected = chardet.detect(raw)
-            if detected['encoding'] and detected['confidence'] > 0.7:
-                try:
-                    with open(path, 'r', encoding=detected['encoding']) as f:
-                        return f.read(read_limit), detected['encoding']
-                except (UnicodeDecodeError, LookupError):
-                    pass
-        except ImportError:
-            pass
-
-        # Fallback to manual detection
-        for encoding in ENGINE_CONFIG.encodings:
-            try:
-                with open(path, 'r', encoding=encoding) as f:
-                    text = f.read(read_limit)
-                return text, encoding
-            except (UnicodeDecodeError, LookupError):
-                continue
-
-        # Last resort: binary read with ignore
-        try:
-            with open(path, 'rb') as f:
-                raw = f.read(read_limit)
-            return raw.decode('utf-8', errors='ignore'), 'utf-8 (lossy)'
-        except Exception:
+            text, encoding, _ = read_text_file(path, max_bytes or None)
+            return text, encoding
+        except OSError:
             return None, None
-    
-    @classmethod
-    def _extract_large_file(cls, path: Path, file_size: int) -> ExtractionResult:
-        """Извлечение из больших файлов через mmap"""
-        try:
-            with open(path, 'rb') as f:
-                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                    # Read first and last chunks
-                    chunk_size = ENGINE_CONFIG.chunk_size
-                    
-                    head = mm[:chunk_size]
-                    # Only read tail if file is large enough that head and tail don't overlap
-                    if file_size > 2 * chunk_size:
-                        tail = mm[-chunk_size:]
-                    else:
-                        tail = b''
-
-                    # Try to decode
-                    for encoding in ENGINE_CONFIG.encodings:
-                        try:
-                            head_text = head.decode(encoding)
-                            tail_text = tail.decode(encoding) if tail else ''
-
-                            if tail_text:
-                                skipped = file_size - 2 * chunk_size
-                                text = f"{head_text}\n\n[...пропущено {skipped} байт...]\n\n{tail_text}"
-                            else:
-                                text = head_text
-                            
-                            return ExtractionResult(
-                                text=text,
-                                metadata={
-                                    'encoding': encoding,
-                                    'size': file_size,
-                                    'truncated': True
-                                }
-                            )
-                        except UnicodeDecodeError:
-                            continue
-                    
-                    return ExtractionResult(error="Large file encoding detection failed")
-                    
-        except Exception as e:
-            return ExtractionResult(error=f"Large file extraction failed: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# JSON EXTRACTOR (with pretty parsing)
+# JSON EXTRACTOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @registry.register
 class JSONExtractor(BaseExtractor):
-    """Извлечение и форматирование JSON"""
-    
+    """Извлечение всех значений из JSON (строки любой длины, числа, ключи)"""
+
     extensions = ['.json']
     priority = 90
-    
+
+    MAX_PARSE_BYTES = 64 * 1024 * 1024
+
     @classmethod
     def is_available(cls) -> bool:
         return True
-    
+
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
-            import json
-            
-            text, encoding = PlainTextExtractor._read_with_encoding(path)
-            
-            if text is None:
-                return ExtractionResult(error="Could not read JSON file")
-            
-            # Parse JSON
+            size = path.stat().st_size
+            text, encoding, truncated = read_text_file(path)
+
+            if size > cls.MAX_PARSE_BYTES or truncated:
+                return ExtractionResult(text=text, metadata={
+                    'encoding': encoding, 'truncated': truncated, 'parsed': False})
+
             try:
                 data = json.loads(text)
-                
-                # Extract text content from common patterns
-                text_parts = []
-                cls._extract_text_from_json(data, text_parts)
-                
-                metadata = {
-                    'encoding': encoding,
-                    'type': type(data).__name__,
-                }
-                
-                if isinstance(data, dict):
-                    metadata['keys'] = list(data.keys())[:20]
-                elif isinstance(data, list):
-                    metadata['length'] = len(data)
-                
-                extracted_text = '\n'.join(text_parts) if text_parts else text[:50000]
-                
-                return ExtractionResult(text=extracted_text, metadata=metadata)
-                
             except json.JSONDecodeError as e:
-                # Return as plain text
-                return ExtractionResult(
-                    text=text,
-                    metadata={'encoding': encoding, 'json_error': str(e)}
-                )
-                
+                # JSON Lines / битый JSON — индексируем как текст
+                return ExtractionResult(text=text, metadata={'encoding': encoding, 'json_error': str(e)})
+
+            collector = TextCollector()
+            cls._extract_text_from_json(data, collector)
+
+            metadata = {'encoding': encoding, 'type': type(data).__name__,
+                        'truncated': collector.truncated}
+            if isinstance(data, dict):
+                metadata['keys'] = list(data.keys())[:20]
+            elif isinstance(data, list):
+                metadata['length'] = len(data)
+
+            return ExtractionResult(text=collector.text('\n'), metadata=metadata)
+
         except Exception as e:
             return ExtractionResult(error=f"JSON extraction failed: {e}")
-    
-    @classmethod
-    def _extract_text_from_json(cls, obj, parts: list, depth: int = 0, max_depth: int = 10):
-        """Итеративное извлечение текстовых значений из JSON (без рекурсии)"""
-        priority_keys = {'text', 'content', 'message', 'body', 'description',
-                        'title', 'name', 'comment', 'note', 'value'}
 
-        # Итеративный обход стеком вместо рекурсии — защита от stack overflow
-        stack = [(obj, 0)]
+    @classmethod
+    def _extract_text_from_json(cls, obj, collector, depth: int = 0, max_depth: int = 64):
+        """Итеративный обход JSON: строки "ключ: значение" для всех скаляров."""
+        if not isinstance(collector, TextCollector):  # совместимость со старым API (list)
+            target = collector
+            collector = TextCollector()
+            cls._extract_text_from_json(obj, collector, depth, max_depth)
+            target.extend(collector.parts)
+            return
+
+        stack = [(obj, None, 0)]
         while stack:
-            current, current_depth = stack.pop()
+            current, key, current_depth = stack.pop()
             if current_depth > max_depth:
                 continue
-
-            if isinstance(current, str):
-                if len(current) > 20:
-                    parts.append(current)
-            elif isinstance(current, dict):
-                # Добавляем в стек в обратном порядке (приоритетные первыми)
-                non_priority = [(v, current_depth + 1) for k, v in current.items()
-                                if k not in priority_keys]
-                priority = [(current[k], current_depth + 1) for k in priority_keys
-                            if k in current]
-                stack.extend(reversed(non_priority))
-                stack.extend(reversed(priority))
+            if isinstance(current, dict):
+                items = list(current.items())
+                for k, v in reversed(items):
+                    stack.append((v, str(k), current_depth + 1))
             elif isinstance(current, list):
-                for item in reversed(current[:100]):
-                    stack.append((item, current_depth + 1))
+                for item in reversed(current):
+                    stack.append((item, key, current_depth + 1))
+            elif current is None:
+                continue
+            else:
+                value = current if isinstance(current, str) else json.dumps(current, ensure_ascii=False)
+                if not value.strip():
+                    continue
+                line = f"{key}: {value}" if key else value
+                if not collector.add(line):
+                    return
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # XML EXTRACTOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_TAG_RE = re.compile(r'<[^>]+>')
+
+
+def strip_markup(text: str) -> str:
+    """Грубое удаление тегов с декодированием HTML-сущностей."""
+    text = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<br\s*/?>|</p>|</div>|</h\d>|</li>|</tr>', '\n', text, flags=re.IGNORECASE)
+    text = _TAG_RE.sub(' ', text)
+    text = html_module.unescape(text)
+    text = re.sub(r'[ \t\r\f\v]+', ' ', text)
+    text = re.sub(r'\n\s*\n+', '\n\n', text)
+    return text.strip()
+
+
 @registry.register
 class XMLExtractor(BaseExtractor):
-    """Извлечение текста из XML"""
-    
+    """Извлечение текста из XML (в порядке документа)"""
+
     extensions = ['.xml', '.xhtml']
     priority = 90
-    
+
+    MAX_PARSE_BYTES = 64 * 1024 * 1024
+
     @classmethod
     def is_available(cls) -> bool:
         return True
-    
+
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
-            text, encoding = PlainTextExtractor._read_with_encoding(path)
-            
-            if text is None:
-                return ExtractionResult(error="Could not read XML file")
-            
-            # Try to parse and extract text
-            try:
+            size = path.stat().st_size
+            if size <= cls.MAX_PARSE_BYTES:
                 import xml.etree.ElementTree as ET
-                
-                root = ET.fromstring(text)
-                text_parts = []
-                cls._extract_text_from_xml(root, text_parts)
-                
-                extracted_text = ' '.join(text_parts) if text_parts else text[:50000]
-                
-                return ExtractionResult(
-                    text=extracted_text,
-                    metadata={
-                        'encoding': encoding,
-                        'root_tag': root.tag
-                    }
-                )
-                
-            except ET.ParseError:
-                # Return as is
-                return ExtractionResult(text=text, metadata={'encoding': encoding})
-                
+                with open(path, 'rb') as f:
+                    raw = f.read()
+                try:
+                    # Разбор из байтов: учитывается encoding из XML-декларации
+                    root = ET.fromstring(raw)
+                    collector = TextCollector()
+                    for chunk in root.itertext():
+                        chunk = chunk.strip()
+                        if chunk and not collector.add(chunk):
+                            break
+                    return ExtractionResult(
+                        text=collector.text(' '),
+                        metadata={'root_tag': root.tag, 'truncated': collector.truncated}
+                    )
+                except ET.ParseError:
+                    pass
+
+            text, encoding, truncated = read_text_file(path)
+            return ExtractionResult(text=strip_markup(text),
+                                    metadata={'encoding': encoding, 'parsed': False, 'truncated': truncated})
+
         except Exception as e:
             return ExtractionResult(error=f"XML extraction failed: {e}")
-    
+
     @classmethod
     def _extract_text_from_xml(cls, element, parts: list):
-        """Итеративное извлечение текста из XML (без рекурсии)"""
-        stack = [element]
-        while stack:
-            el = stack.pop()
-            if el.text and el.text.strip():
-                parts.append(el.text.strip())
-            # Добавляем детей в обратном порядке для сохранения порядка обхода
-            children = list(el)
-            for child in reversed(children):
-                stack.append(child)
-            for child in children:
-                if child.tail and child.tail.strip():
-                    parts.append(child.tail.strip())
+        """Текст элемента в порядке документа (совместимость)."""
+        for chunk in element.itertext():
+            if chunk and chunk.strip():
+                parts.append(chunk.strip())
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HTML EXTRACTOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def html_to_text(markup: str) -> Tuple[str, Optional[str]]:
+    """HTML → текст. Returns (text, title)."""
+    try:
+        from bs4 import BeautifulSoup
+        try:
+            soup = BeautifulSoup(markup, 'lxml')
+        except Exception:
+            soup = BeautifulSoup(markup, 'html.parser')
+        for tag in soup(['script', 'style', 'noscript', 'template', 'meta', 'link']):
+            tag.decompose()
+        title = soup.title.get_text(strip=True) if soup.title else None
+        return soup.get_text(separator='\n', strip=True), (title or None)
+    except ImportError:
+        m = re.search(r'<title[^>]*>(.*?)</title>', markup, re.IGNORECASE | re.DOTALL)
+        title = html_module.unescape(m.group(1)).strip() if m else None
+        return strip_markup(markup), title
+
+
 @registry.register
 class HTMLExtractor(BaseExtractor):
     """Извлечение текста из HTML"""
-    
+
     extensions = ['.html', '.htm']
     priority = 85
-    
+
     @classmethod
     def is_available(cls) -> bool:
         return True
-    
+
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
-            text, encoding = PlainTextExtractor._read_with_encoding(path)
-            
-            if text is None:
-                return ExtractionResult(error="Could not read HTML file")
-            
-            # Try BeautifulSoup first
-            try:
-                from bs4 import BeautifulSoup
-                
-                soup = BeautifulSoup(text, 'html.parser')
-                
-                # Remove scripts and styles
-                for tag in soup(['script', 'style', 'meta', 'link']):
-                    tag.decompose()
-                
-                # Get title
-                title = soup.title.string if soup.title else None
-                
-                # Get text
-                extracted_text = soup.get_text(separator='\n', strip=True)
-                
-                return ExtractionResult(
-                    text=extracted_text,
-                    metadata={
-                        'encoding': encoding,
-                        'title': title
-                    }
-                )
-                
-            except ImportError:
-                # Fallback to regex
-                import re
-                
-                # Remove scripts and styles
-                text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
-                text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-                
-                # Remove tags
-                text = re.sub(r'<[^>]+>', ' ', text)
-                
-                # Decode entities
-                text = re.sub(r'&nbsp;', ' ', text)
-                text = re.sub(r'&lt;', '<', text)
-                text = re.sub(r'&gt;', '>', text)
-                text = re.sub(r'&amp;', '&', text)
-                
-                # Cleanup
-                text = ' '.join(text.split())
-                
-                return ExtractionResult(text=text, metadata={'encoding': encoding})
-                
+            text, encoding, truncated = read_text_file(path)
+            extracted_text, title = html_to_text(text)
+            return ExtractionResult(
+                text=extracted_text,
+                metadata={'encoding': encoding, 'title': title, 'truncated': truncated}
+            )
         except Exception as e:
             return ExtractionResult(error=f"HTML extraction failed: {e}")
 
@@ -384,14 +325,12 @@ class HTMLExtractor(BaseExtractor):
 
 @registry.register
 class CSVExtractor(BaseExtractor):
-    """Извлечение из CSV/TSV — потоковое чтение, безопасно для больших файлов"""
+    """Извлечение из CSV/TSV — потоковое чтение всех строк (до лимита объёма текста)"""
 
     extensions = ['.csv', '.tsv']
     priority = 80
 
-    MAX_ROWS = 1000
-    MAX_CELL = 200
-    MAX_READ_BYTES = 50 * 1024 * 1024  # 50MB max read
+    MAX_CELL = 10000
 
     @classmethod
     def is_available(cls) -> bool:
@@ -400,82 +339,72 @@ class CSVExtractor(BaseExtractor):
     @classmethod
     def _detect_encoding(cls, path: Path) -> str:
         """Определить кодировку по первым байтам"""
-        try:
-            import chardet
-            with open(path, 'rb') as f:
-                raw = f.read(65536)
-            detected = chardet.detect(raw)
-            if detected['encoding'] and detected['confidence'] > 0.7:
-                return detected['encoding']
-        except ImportError:
-            pass
+        with open(path, 'rb') as f:
+            raw = f.read(256 * 1024)
+        encoding, _ = detect_encoding(raw, final=len(raw) < 256 * 1024)
+        return encoding
 
-        for enc in ENGINE_CONFIG.encodings:
-            try:
-                with open(path, 'r', encoding=enc) as f:
-                    f.read(4096)
-                return enc
-            except (UnicodeDecodeError, LookupError):
-                continue
-        return 'utf-8'
+    @classmethod
+    def _detect_delimiter(cls, sample: str, default: str) -> str:
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+            return dialect.delimiter
+        except csv.Error:
+            # Sniffer не уверен: выбираем самый частый разделитель первой строки
+            first = sample.split('\n', 1)[0]
+            counts = {d: first.count(d) for d in (',', ';', '\t', '|')}
+            best = max(counts, key=counts.get)
+            return best if counts[best] > 0 else default
 
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
             file_size = path.stat().st_size
             encoding = cls._detect_encoding(path)
-            delimiter = '\t' if path.suffix.lower() == '.tsv' else ','
+            default = '\t' if path.suffix.lower() == '.tsv' else ','
 
-            try:
-                # Stream read — never load entire file
-                with open(path, 'r', encoding=encoding, errors='replace', newline='') as f:
-                    reader = csv.reader(f, delimiter=delimiter)
+            with open(path, 'r', encoding=encoding, errors='replace', newline='') as f:
+                sample = f.read(64 * 1024)
+                delimiter = cls._detect_delimiter(sample, default)
+                f.seek(0)
+                reader = csv.reader(f, delimiter=delimiter)
 
-                    headers = []
-                    text_parts = []
-                    row_count = 0
-
+                collector = TextCollector()
+                headers = []
+                row_count = 0
+                try:
                     for row in reader:
+                        cells = [c[:cls.MAX_CELL] for c in row]
                         if row_count == 0:
-                            headers = [c[:cls.MAX_CELL] for c in row]
-                            text_parts.append(' | '.join(headers))
-                        else:
-                            row_text = ' | '.join(str(c)[:cls.MAX_CELL] for c in row)
-                            text_parts.append(row_text)
-
+                            headers = cells
                         row_count += 1
-                        if row_count >= cls.MAX_ROWS:
+                        if not collector.add(' | '.join(cells)):
                             break
+                except csv.Error as e:
+                    # Битая строка: дочитываем остаток как обычный текст
+                    rest = f.read(max(0, collector.limit - collector.size))
+                    collector.add(rest)
+                    csv_error = str(e)
+                else:
+                    csv_error = None
 
-                    if text_parts:
-                        return ExtractionResult(
-                            text='\n'.join(text_parts),
-                            metadata={
-                                'encoding': encoding,
-                                'headers': headers,
-                                'rows_read': row_count,
-                                'file_size': file_size,
-                                'delimiter': delimiter,
-                                'truncated': row_count >= cls.MAX_ROWS
-                            }
-                        )
-
-            except csv.Error as e:
-                # Fallback: read first chunk as plain text
-                with open(path, 'r', encoding=encoding, errors='replace') as f:
-                    text = f.read(cls.MAX_READ_BYTES)
-                return ExtractionResult(
-                    text=text,
-                    metadata={'encoding': encoding, 'csv_error': str(e), 'file_size': file_size}
-                )
-
-            return ExtractionResult(error="Empty CSV file")
+            metadata = {
+                'encoding': encoding,
+                'headers': headers[:50],
+                'rows_read': row_count,
+                'file_size': file_size,
+                'delimiter': delimiter,
+                'truncated': collector.truncated,
+            }
+            if csv_error:
+                metadata['csv_error'] = csv_error
+            return ExtractionResult(text=collector.text('\n'), metadata=metadata)
 
         except Exception as e:
             return ExtractionResult(error=f"CSV extraction failed: {e}")
 
 
 __all__ = [
-    'PlainTextExtractor', 'JSONExtractor', 'XMLExtractor', 
-    'HTMLExtractor', 'CSVExtractor'
+    'PlainTextExtractor', 'JSONExtractor', 'XMLExtractor',
+    'HTMLExtractor', 'CSVExtractor', 'read_text_file', 'html_to_text', 'strip_markup',
 ]

@@ -1,99 +1,86 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# ASTREX v3.0 — Requirements
+# ASTREX v3.0 — Requirements (Python 3.10+)
+#
+#   python3 -m venv venv && venv/bin/pip install -r requirements.txt
+#
+# Удобнее: ./install.sh — ставит пакеты по режиму, подбирает PyTorch под GPU
+# и проверяет системные утилиты. GUI сам использует venv/ проекта.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CORE (Required)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# PDF extraction
-pypdf>=3.0.0
-
-# Character encoding detection
-chardet>=5.0.0
+pypdf>=3.0.0          # PDF
+chardet>=5.0.0        # определение кодировки (не кириллица)
+pyyaml>=6.0           # ~/.astrex/config.yaml
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# EXTRACTORS (Optional but recommended)
+# EXTRACTORS (recommended)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Legacy Office (DOC, XLS, PPT)
-olefile>=0.46
-
-# RTF
-striprtf>=0.0.26
-
-# Email MSG
-extract-msg>=0.45.0
-
-# RAR archives
-rarfile>=4.0
-
-# 7z archives
-py7zr>=0.20.0
-
-# HTML parsing
+olefile>=0.46         # DOC, XLS, PPT, MSG
+xlrd>=2.0.1           # XLS (без него — встроенный разбор BIFF8)
+openpyxl>=3.1         # отчёты XLSX
+striprtf>=0.0.26      # RTF (без него — встроенный разбор)
+extract-msg>=0.45.0   # Outlook MSG
+rarfile>=4.0          # RAR (нужна утилита unrar / unar / bsdtar)
+py7zr>=0.20.0         # 7z
 beautifulsoup4>=4.12.0
-lxml>=4.9.0
+lxml>=4.9.0           # HTML / XML
+Pillow>=10.0          # изображения, EXIF/GPS, OCR (утилита tesseract)
+numpy>=1.24           # быстрый simhash в dedup
+zstandard>=0.21       # .zst
+lz4>=4.0              # .lz4
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# NLP (Optional - enables advanced analysis)
+# NLP (recommended)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Russian morphology
-pymorphy2>=0.9.1
-pymorphy2-dicts-ru>=2.4.0
+# Морфология: pymorphy3 (pymorphy2 не работает на Python 3.11+)
+pymorphy3>=2.0
+pymorphy3-dicts-ru
+rapidfuzz>=3.0.0      # нечёткий поиск
 
-# Fuzzy search
-rapidfuzz>=3.0.0
-
-# spaCy (Python < 3.14 only)
+# spaCy (NER) — если для вашей версии Python есть колёса:
 # spacy>=3.5.0
-
-# Sentence embeddings
-sentence-transformers>=2.2.0
+#   + python -m spacy download ru_core_news_sm
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# VECTOR STORE (Optional - enables semantic search)
+# SEMANTIC / RAG / WEB (optional)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ChromaDB vector database
-chromadb>=0.4.0
+# sentence-transformers>=2.2.0   # семантическая релевантность (скачивает модель с Hugging Face)
+# chromadb>=0.4.0                # векторная БД для ingest / ask
+# fastapi>=0.100.0               # web API (astrex.py web)
+# uvicorn>=0.23.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# WEB API (Optional - enables REST API)
+# MORE FORMATS (optional)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# FastAPI framework
-fastapi>=0.100.0
-uvicorn>=0.23.0
+# mutagen>=1.47                  # метаданные аудио (и утилита ffprobe из ffmpeg)
+# openai-whisper                 # транскрипция аудио/видео (нужен ffmpeg)
+# scapy>=2.5                     # PCAP / PCAPNG
+# libpff-python                  # PST без утилиты readpst
+# weasyprint>=60                 # отчёты PDF
+# pyodbc                         # MS Access через ODBC (иначе — утилиты mdbtools)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GPU ACCELERATION (Optional)
+# GPU ACCELERATION (optional)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# PyTorch — раскомментируйте ОДНУ строку под ваше железо:
-# pip install torch torchvision torchaudio                                     # CPU only
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118   # NVIDIA CUDA 11.8
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124   # NVIDIA CUDA 12.4
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2 # AMD ROCm 6.2
-
-# Intel Arc / iGPU (установите PyTorch XPU):
-# pip install torch torchvision torchaudio --index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
-# pip install intel-extension-for-pytorch          # Intel IPEX для XPU
-
-# Intel OpenVINO (альтернатива для iGPU без IPEX):
-# pip install openvino>=2023.0.0
+# PyTorch — ОДНА из команд под ваше железо:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu      # только CPU
+#   pip install torch                                                       # NVIDIA (CUDA в колесе PyPI)
+#   pip install torch --index-url https://download.pytorch.org/whl/rocm6.2  # AMD ROCm
+#   pip install torch --index-url https://download.pytorch.org/whl/xpu      # Intel Arc / iGPU (PyTorch ≥ 2.5)
+# Intel OpenVINO (информационно, модели в ASTREX работают через PyTorch):
+#   pip install openvino>=2024.0
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DEVELOPMENT (Optional)
+# DEVELOPMENT (optional)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Testing
-# pytest>=7.0.0
-# pytest-asyncio>=0.21.0
-
-# Type checking
-# mypy>=1.0.0
-
-# Linting
-# ruff>=0.1.0
+# Тесты: python -m unittest discover -s tests -t .
+# httpx                          # для tests/test_web.py (TestClient)

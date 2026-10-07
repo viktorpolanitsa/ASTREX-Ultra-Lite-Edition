@@ -4,16 +4,18 @@ ASTREX v3.0 — Network Extractors
 PCAP, PCAPNG, Netflow parsers for network traffic analysis
 """
 
+import shutil
 import struct
-import string
+import subprocess
 from pathlib import Path
 from typing import Optional, Dict, List, Set, Tuple
-from collections import Counter, defaultdict
+from collections import Counter
 
 from .base import BaseExtractor, ExtractionResult, registry
+from core.config import ENGINE_CONFIG
 from core.logging_setup import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("astrex.network")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -33,28 +35,25 @@ class PcapExtractor(BaseExtractor):
     def is_available(cls) -> bool:
         if cls._available is None:
             try:
-                from scapy.all import rdpcap, IP, TCP, UDP, DNS, Raw
+                import scapy  # noqa: F401  (лёгкая проверка, без импорта scapy.all)
                 cls._available = True
             except ImportError:
                 cls._available = False
-                logger.warning("scapy not available - PCAP extraction disabled")
+                logger.debug("scapy not available - PCAP extraction disabled")
         return cls._available
 
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
-            from scapy.all import rdpcap, IP, TCP, UDP, DNS, Raw, DNSQR
+            from scapy.all import PcapReader, IP, TCP, UDP, DNS, Raw, DNSQR
 
-            logger.info(f"Reading PCAP file: {path}")
+            logger.debug(f"Reading PCAP file: {path}")
+            max_packets = ENGINE_CONFIG.pcap_max_packets
 
-            # Read packets (limit to first 10000)
             try:
-                packets = rdpcap(str(path), count=10000)
+                reader = PcapReader(str(path))
             except Exception as e:
                 return ExtractionResult(error=f"Failed to read PCAP: {e}")
-
-            if not packets:
-                return ExtractionResult(error="No packets found in PCAP file")
 
             # Data structures for analysis
             ip_conversations: Dict[Tuple[str, str], int] = Counter()
@@ -64,8 +63,25 @@ class PcapExtractor(BaseExtractor):
             unique_ips: Set[str] = set()
             timestamps = []
 
-            # Process packets
-            for pkt in packets:
+            # Process packets (потоково, без загрузки всего файла в память)
+            packet_count = 0
+            truncated = False
+            try:
+                packet_iter = iter(reader)
+            except Exception as e:
+                reader.close()
+                return ExtractionResult(error=f"Failed to read PCAP: {e}")
+            while True:
+                try:
+                    pkt = next(packet_iter)
+                except StopIteration:
+                    break
+                except Exception:
+                    break  # обрезанный/повреждённый хвост файла
+                if packet_count >= max_packets:
+                    truncated = True
+                    break
+                packet_count += 1
                 # Extract timestamp
                 if hasattr(pkt, 'time'):
                     timestamps.append(pkt.time)
@@ -111,13 +127,17 @@ class PcapExtractor(BaseExtractor):
                                     host = line.split(':', 1)[1].strip()
                                     break
 
-                            if request_line:
+                            if request_line and len(http_requests) < 1000:
                                 if host:
                                     http_requests.append(f"{host} - {request_line}")
                                 else:
                                     http_requests.append(request_line)
                     except Exception:
                         pass
+            reader.close()
+
+            if packet_count == 0:
+                return ExtractionResult(error="No packets found in PCAP file")
 
             # Build structured text output
             text_parts = []
@@ -129,20 +149,24 @@ class PcapExtractor(BaseExtractor):
                 key=lambda x: x[1],
                 reverse=True
             )
-            for (src, dst), count in sorted_conversations[:50]:  # Top 50
+            for (src, dst), count in sorted_conversations[:500]:
                 text_parts.append(f"{src} -> {dst}: {count} packets")
 
             # DNS Queries
             if dns_queries:
                 text_parts.append("\n=== DNS Queries ===")
-                for query in sorted(dns_queries)[:100]:  # Top 100
+                for query in sorted(dns_queries)[:5000]:
                     text_parts.append(query)
 
             # HTTP Requests
             if http_requests:
                 text_parts.append("\n=== HTTP Requests ===")
-                for req in http_requests[:50]:  # Top 50
+                for req in http_requests:
                     text_parts.append(req)
+
+            # Все IP-адреса (для поиска по адресу)
+            text_parts.append("\n=== IP Addresses ===")
+            text_parts.append(' '.join(sorted(unique_ips)[:5000]))
 
             # Port Statistics
             text_parts.append("\n=== Port Statistics ===")
@@ -153,7 +177,7 @@ class PcapExtractor(BaseExtractor):
 
             # Summary
             text_parts.append("\n=== Summary ===")
-            text_parts.append(f"Total packets: {len(packets)}")
+            text_parts.append(f"Total packets: {packet_count}" + (" (limit reached)" if truncated else ""))
             text_parts.append(f"Unique IP addresses: {len(unique_ips)}")
             text_parts.append(f"Unique ports: {len(port_stats)}")
             text_parts.append(f"IP conversations: {len(ip_conversations)}")
@@ -176,7 +200,8 @@ class PcapExtractor(BaseExtractor):
 
             # Build metadata
             metadata = {
-                'packet_count': len(packets),
+                'packet_count': packet_count,
+                'truncated': truncated,
                 'unique_ips': len(unique_ips),
                 'unique_ports': len(port_stats),
                 'dns_queries': list(dns_queries)[:100],  # Limit for metadata
@@ -196,7 +221,7 @@ class PcapExtractor(BaseExtractor):
                 metadata['capture_end'] = ts_max
                 metadata['duration_seconds'] = ts_max - ts_min
 
-            logger.info(f"PCAP extraction complete: {len(packets)} packets analyzed")
+            logger.debug(f"PCAP extraction complete: {packet_count} packets analyzed")
             return ExtractionResult(text=text, metadata=metadata)
 
         except Exception as e:
@@ -236,11 +261,25 @@ class NetflowExtractor(BaseExtractor):
         return True  # Uses struct for basic parsing
 
     @classmethod
+    def _nfdump(cls, path: Path) -> Optional[str]:
+        """Прочитать nfcapd через утилиту nfdump (если установлена)."""
+        nfdump = shutil.which('nfdump')
+        if not nfdump:
+            return None
+        try:
+            result = subprocess.run([nfdump, '-r', str(path), '-o', 'csv', '-c', '100000', '-q'],
+                                    capture_output=True, timeout=300)
+            if result.returncode == 0 and result.stdout:
+                return result.stdout.decode('utf-8', errors='replace')
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
+
+    @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
             file_size = path.stat().st_size
 
-            # Try to read as text first
             text_parts = []
             metadata = {
                 'file_size': file_size,
@@ -252,20 +291,19 @@ class NetflowExtractor(BaseExtractor):
                 with open(path, 'rb') as f:
                     data = f.read(min(file_size, 65536))  # First 64KB
 
-                # Check for magic bytes or known headers
-                if data[:4] == b'NFCA' or data[:4] == b'\xa5\xca\x1d\x00':
-                    text_parts.append("=== Netflow Capture File ===")
+                # nfdump: uint16 magic 0xA50C (little-endian: 0C A5) + uint16 version
+                if len(data) >= 4 and data[:2] == b'\x0c\xa5':
+                    version = struct.unpack('<H', data[2:4])[0]
+                    metadata['format'] = 'nfcapd'
+                    metadata['nfcapd_version'] = version
+                    text_parts.append("=== Netflow Capture File (nfcapd) ===")
                     text_parts.append(f"File size: {file_size} bytes")
-
-                    # Extract header info if possible
-                    try:
-                        # Basic nfcapd header structure (simplified)
-                        magic = struct.unpack('<I', data[0:4])[0]
-                        version = struct.unpack('<H', data[4:6])[0]
-                        text_parts.append(f"Magic: 0x{magic:08x}")
-                        text_parts.append(f"Version: {version}")
-                    except Exception:
-                        pass
+                    text_parts.append(f"Layout version: {version}")
+                    flows = cls._nfdump(path)
+                    if flows:
+                        text_parts.append("\n=== Flows (nfdump) ===")
+                        text_parts.append(flows[:ENGINE_CONFIG.max_extracted_chars])
+                        return ExtractionResult(text='\n'.join(text_parts), metadata=metadata)
 
                 # Extract printable strings (like strings command)
                 printable_strings = cls._extract_printable_strings(data, min_length=4)
@@ -293,19 +331,14 @@ class NetflowExtractor(BaseExtractor):
                     pass
 
                 if not text_parts:
-                    text_parts.append("=== Binary Netflow File ===")
-                    text_parts.append(f"File size: {file_size} bytes")
-                    text_parts.append("Binary format detected - specialized tools required for full analysis")
-                    text_parts.append("Suggested tools: nfdump, flow-tools, Wireshark")
+                    metadata['warning'] = "Binary netflow format: install nfdump for full analysis"
 
                 text = '\n'.join(text_parts)
                 return ExtractionResult(text=text, metadata=metadata)
 
             except Exception as e:
-                # Fallback: just report metadata
-                text = f"=== Netflow File ===\nFile size: {file_size} bytes\nBinary format - use nfdump or flow-tools for analysis"
                 metadata['parse_error'] = str(e)
-                return ExtractionResult(text=text, metadata=metadata)
+                return ExtractionResult(text='', metadata=metadata)
 
         except Exception as e:
             logger.error(f"Netflow extraction failed: {e}", exc_info=True)

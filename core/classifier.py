@@ -7,12 +7,12 @@ and topic extraction capabilities.
 
 import re
 from typing import List, Dict, Tuple, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections import Counter, defaultdict
 
 from .logging_setup import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("astrex.classifier")
 
 
 # Simple Russian stopwords set
@@ -20,8 +20,10 @@ RUSSIAN_STOPWORDS: Set[str] = {
     "и", "в", "на", "с", "по", "не", "что", "это", "как", "для",
     "из", "за", "к", "о", "от", "до", "или", "но", "а", "у",
     "при", "так", "же", "бы", "был", "была", "было", "были",
-    "быть", "есть", "была", "будет", "более", "эти", "этот",
-    "было", "весь", "вся", "все", "который", "которая", "которые"
+    "быть", "есть", "будет", "более", "эти", "этот",
+    "весь", "вся", "все", "который", "которая", "которые", "которых",
+    "также", "является", "может", "можно", "этого", "этой", "только",
+    "через", "после", "когда", "между", "своей", "своего", "очень"
 }
 
 
@@ -45,36 +47,41 @@ class DocumentClassifier:
 
     def __init__(self):
         """Initialize classifier with predefined categories and keywords."""
-        self.logger = get_logger(self.__class__.__name__)
+        self.logger = get_logger("astrex.classifier")
 
-        # Predefined categories with Russian keyword patterns
+        # Predefined categories: ключевые слова сравниваются с НАЧАЛОМ слова
+        # (префикс), фразы — целиком; ё приводится к е.
         self.categories = {
             "финансы": [
-                "оплат", "счёт", "баланс", "перевод", "сумма", "рубл",
-                "доллар", "банк", "бюджет", "прибыль", "убыт"
+                "оплат", "счет", "баланс", "перевод", "сумм", "рубл",
+                "доллар", "банк", "бюджет", "прибыл", "убыт", "налог", "кредит"
             ],
             "юридический": [
-                "договор", "контракт", "иск", "суд", "закон", "право",
-                "устав", "лицензи", "протокол"
+                "договор", "контракт", "иск", "суд", "закон", "прав",
+                "устав", "лицензи", "протокол", "кодекс", "истец", "ответчик"
             ],
             "кадры": [
-                "сотрудник", "зарплат", "увольн", "приём", "отпуск",
-                "больнич", "трудов"
+                "сотрудник", "зарплат", "увольн", "прием на работу", "отпуск",
+                "больничн", "трудов", "ваканси", "резюме", "штатн"
             ],
             "техническая": [
-                "сервер", "код", "API", "база данных", "deploy", "git", "docker"
+                "сервер", "исходный код", "программн", "api", "база данных", "deploy",
+                "git", "docker", "скрипт", "репозитор", "kubernetes", "python"
             ],
             "переписка": [
                 "уважаем", "здравствуйте", "с уважением", "добрый день",
-                "письмо", "ответ"
+                "письм", "ответ на"
             ],
             "отчёт": [
-                "отчёт", "итог", "результат", "анализ", "показатель",
+                "отчет", "итог", "результат", "анализ", "показател",
                 "динамик", "квартал"
             ]
         }
+        self.categories = {
+            cat: [self._norm(k) for k in kws] for cat, kws in self.categories.items()
+        }
 
-        # Sentiment keywords
+        # Sentiment keywords (префиксы слов)
         self.positive_words = {
             "успех", "хорош", "отличн", "прибыль", "рост", "одобрен",
             "достижен", "улучшен", "эффективн", "качеств"
@@ -107,7 +114,7 @@ class DocumentClassifier:
                 char_count=0
             )
 
-        text_lower = text.lower()
+        text_lower = self._norm(text)
         words = re.findall(r'\w+', text_lower)
         total_words = len(words)
 
@@ -117,11 +124,12 @@ class DocumentClassifier:
             count = 0
             for keyword in keywords:
                 if ' ' in keyword:
-                    # Multi-word phrase: search in full text (word tokens won't contain spaces)
-                    count += text_lower.count(keyword)
+                    # Фраза: ищем целиком по границам слов
+                    count += len(re.findall(r'(?<!\w)' + re.escape(keyword) + r'(?!\w)', text_lower))
                 else:
-                    # Single-word prefix: count tokens that contain the keyword as substring
-                    count += sum(1 for word in words if keyword in word)
+                    # Слово: совпадение по началу слова (а не по подстроке —
+                    # иначе "иск" находился в "риск", "код" в "кодекс")
+                    count += sum(1 for word in words if word.startswith(keyword))
 
             # Normalize by total words
             scores[category] = count / total_words if total_words > 0 else 0.0
@@ -147,7 +155,7 @@ class DocumentClassifier:
         # Detect other properties
         language = self.detect_language(text)
         sentiment = self.detect_sentiment(text_lower)
-        topics = self.extract_topics(text_lower)
+        topics = self.extract_topics(text.lower())
 
         self.logger.debug(
             f"Classified text: category={category}, confidence={confidence:.2f}, "
@@ -163,6 +171,11 @@ class DocumentClassifier:
             word_count=total_words,
             char_count=len(text)
         )
+
+    @staticmethod
+    def _norm(text: str) -> str:
+        """Нижний регистр и ё → е."""
+        return (text or '').lower().replace('ё', 'е')
 
     def detect_language(self, text: str) -> str:
         """
@@ -207,24 +220,12 @@ class DocumentClassifier:
         if not text:
             return "neutral"
 
-        words = re.findall(r'\w+', text.lower())  # keep duplicates — frequency matters for sentiment
+        words = re.findall(r'\w+', self._norm(text))  # keep duplicates — frequency matters
 
-        # Count positive and negative word matches
-        positive_count = 0
-        negative_count = 0
-
-        for word in words:
-            # Check if any positive keyword is in the word
-            for pos_keyword in self.positive_words:
-                if pos_keyword in word:
-                    positive_count += 1
-                    break
-
-            # Check if any negative keyword is in the word
-            for neg_keyword in self.negative_words:
-                if neg_keyword in word:
-                    negative_count += 1
-                    break
+        positive_prefixes = tuple(self._norm(w) for w in self.positive_words)
+        negative_prefixes = tuple(self._norm(w) for w in self.negative_words)
+        positive_count = sum(1 for word in words if word.startswith(positive_prefixes))
+        negative_count = sum(1 for word in words if word.startswith(negative_prefixes))
 
         # Determine sentiment based on ratio
         total = positive_count + negative_count
@@ -280,7 +281,7 @@ class BatchClassifier:
     def __init__(self):
         """Initialize batch classifier."""
         self.classifier = DocumentClassifier()
-        self.logger = get_logger(self.__class__.__name__)
+        self.logger = get_logger("astrex.classifier")
 
     def classify_batch(
         self,

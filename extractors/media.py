@@ -1,18 +1,152 @@
 #!/usr/bin/env python3
 """
 ASTREX v3.0 — Media Extractors
-Audio and Video file processing with transcription
+Audio and Video: метаданные (mutagen / ffprobe) и транскрипция (Whisper).
 """
 
+import json
+import os
+import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Any
 
-from .base import BaseExtractor, ExtractionResult, registry
+from .base import BaseExtractor, ExtractionResult, registry, worker_temp_dir
+from core.config import ENGINE_CONFIG
 from core.logging_setup import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger("astrex.media")
+
+_SUBPROCESS_TIMEOUT = 120
+
+
+class _Whisper:
+    """Модель Whisper загружается один раз на процесс (а не на каждый файл)."""
+    _model = None
+    _checked = False
+    _available = False
+    _lock = threading.Lock()
+
+    @classmethod
+    def available(cls) -> bool:
+        if not cls._checked:
+            try:
+                import whisper  # noqa: F401
+                cls._available = bool(ENGINE_CONFIG.transcribe_media)
+            except ImportError:
+                cls._available = False
+            cls._checked = True
+        return cls._available
+
+    @classmethod
+    def transcribe(cls, audio_path: str) -> Optional[str]:
+        if not cls.available():
+            return None
+        try:
+            import whisper
+            with cls._lock:
+                if cls._model is None:
+                    logger.info(f"Loading Whisper model '{ENGINE_CONFIG.whisper_model}'...")
+                    cls._model = whisper.load_model(ENGINE_CONFIG.whisper_model)
+                result = cls._model.transcribe(audio_path)
+            return (result.get('text') or '').strip()
+        except Exception as e:
+            logger.error(f"Whisper transcription failed for {audio_path}: {e}")
+            return None
+
+
+def _tool(name: str) -> Optional[str]:
+    return shutil.which(name)
+
+
+def _ffprobe(path: Path) -> Dict[str, Any]:
+    """Метаданные медиафайла через ffprobe (с таймаутом)."""
+    ffprobe = _tool('ffprobe')
+    if not ffprobe:
+        return {}
+    metadata: Dict[str, Any] = {}
+    try:
+        result = subprocess.run(
+            [ffprobe, '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', str(path)],
+            capture_output=True, text=True, timeout=_SUBPROCESS_TIMEOUT, check=True,
+        )
+        data = json.loads(result.stdout or '{}')
+        fmt = data.get('format', {})
+        if 'duration' in fmt:
+            metadata['duration'] = round(float(fmt['duration']), 2)
+        if 'size' in fmt:
+            metadata['size'] = int(fmt['size'])
+        if 'bit_rate' in fmt:
+            metadata['bitrate'] = int(fmt['bit_rate'])
+        for key, value in (fmt.get('tags') or {}).items():
+            if key.lower() in ('title', 'artist', 'album', 'date', 'comment', 'creation_time',
+                               'location', 'encoder'):
+                metadata[key.lower()] = str(value)[:300]
+        for stream in data.get('streams', []):
+            if stream.get('codec_type') == 'video':
+                metadata['video_codec'] = stream.get('codec_name')
+                if 'width' in stream and 'height' in stream:
+                    metadata['resolution'] = f"{stream['width']}x{stream['height']}"
+                if 'r_frame_rate' in stream:
+                    metadata['fps'] = stream['r_frame_rate']
+            elif stream.get('codec_type') == 'audio':
+                metadata['audio_codec'] = stream.get('codec_name')
+                if 'sample_rate' in stream:
+                    metadata['sample_rate'] = stream['sample_rate']
+    except Exception as e:
+        logger.debug(f"ffprobe failed for {path}: {e}")
+    return metadata
+
+
+def _extract_audio(src: Path, max_duration: Optional[float]) -> Optional[str]:
+    """Аудиодорожка в WAV 16 кГц моно (с обрезкой до max_duration). None — нет ffmpeg/ошибка."""
+    ffmpeg = _tool('ffmpeg')
+    if not ffmpeg:
+        return None
+    fd, out = tempfile.mkstemp(prefix="astrex-audio-", suffix=".wav", dir=str(worker_temp_dir()))
+    os.close(fd)
+    cmd = [ffmpeg, '-nostdin', '-y', '-i', str(src), '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1']
+    if max_duration:
+        cmd += ['-t', str(int(max_duration))]
+    cmd.append(out)
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=max(_SUBPROCESS_TIMEOUT, int(max_duration or 0)), check=True)
+        return out
+    except Exception as e:
+        logger.debug(f"ffmpeg failed for {src}: {e}")
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        return None
+
+
+def _metadata_text(metadata: Dict[str, Any]) -> str:
+    keys = ('title', 'artist', 'album', 'date', 'comment', 'creation_time', 'location')
+    return '\n'.join(f"{k}: {metadata[k]}" for k in keys if metadata.get(k))
+
+
+def _transcribe_media(path: Path, duration: Optional[float]) -> Optional[str]:
+    if not _Whisper.available():
+        return None
+    limit = ENGINE_CONFIG.media_max_duration
+    needs_trim = duration is None or (limit and duration > limit)
+    wav = _extract_audio(path, limit) if (needs_trim or path.suffix.lower() not in ('.wav', '.mp3')) else None
+    if wav is None and needs_trim and duration is not None and limit and duration > limit:
+        logger.warning(f"{path.name}: {duration:.0f}s > {limit}s limit and ffmpeg is not available — "
+                       f"transcription skipped")
+        return None
+    try:
+        return _Whisper.transcribe(wav or str(path))
+    finally:
+        if wav:
+            try:
+                os.unlink(wav)
+            except OSError:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -21,139 +155,61 @@ logger = get_logger(__name__)
 
 @registry.register
 class AudioExtractor(BaseExtractor):
-    """Извлечение текста из аудио файлов через Whisper"""
+    """Аудио: теги и параметры (mutagen/ffprobe) + транскрипция Whisper (если установлен)"""
 
-    extensions = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.wma']
+    extensions = ['.mp3', '.wav', '.ogg', '.flac', '.m4a', '.aac', '.wma', '.opus']
     priority = 10
 
-    _available: Optional[bool] = None
-    _whisper_available: Optional[bool] = None
-    _mutagen_available: Optional[bool] = None
-
-    # Максимальная длительность для транскрипции (секунды)
-    MAX_DURATION = 1800  # 30 minutes
+    MAX_DURATION = 1800  # совместимость; используется ENGINE_CONFIG.media_max_duration
 
     @classmethod
     def is_available(cls) -> bool:
-        if cls._available is None:
-            # Check whisper availability
-            try:
-                import whisper
-                cls._whisper_available = True
-            except ImportError:
-                cls._whisper_available = False
-
-            # Check mutagen availability
-            try:
-                import mutagen
-                cls._mutagen_available = True
-            except ImportError:
-                cls._mutagen_available = False
-
-            # Available if at least one is available
-            cls._available = cls._whisper_available or cls._mutagen_available
-
-        return cls._available
+        try:
+            import mutagen  # noqa: F401
+            return True
+        except ImportError:
+            return bool(_tool('ffprobe')) or _Whisper.available()
 
     @classmethod
     def _extract_metadata(cls, path: Path) -> dict:
-        """Извлечение метаданных из аудио файла"""
-        metadata = {}
-
-        if not cls._mutagen_available:
-            return metadata
-
+        metadata: Dict[str, Any] = {}
         try:
             import mutagen
-
-            audio = mutagen.File(path)
-            if audio is None:
-                return metadata
-
-            # Duration
-            if hasattr(audio.info, 'length'):
-                metadata['duration'] = round(audio.info.length, 2)
-
-            # Sample rate
-            if hasattr(audio.info, 'sample_rate'):
-                metadata['sample_rate'] = audio.info.sample_rate
-
-            # Bitrate
-            if hasattr(audio.info, 'bitrate'):
-                metadata['bitrate'] = audio.info.bitrate
-
-            # Channels
-            if hasattr(audio.info, 'channels'):
-                metadata['channels'] = audio.info.channels
-
-            # Tags
-            if audio.tags:
-                # Try to get common tags
-                for key in ['title', 'artist', 'album', 'date']:
-                    if key in audio.tags:
-                        value = audio.tags[key]
-                        if isinstance(value, list) and value:
-                            metadata[key] = str(value[0])
-                        else:
-                            metadata[key] = str(value)
-
+            audio = mutagen.File(str(path), easy=True)
+            if audio is not None:
+                info = getattr(audio, 'info', None)
+                for attr, key in (('length', 'duration'), ('sample_rate', 'sample_rate'),
+                                  ('bitrate', 'bitrate'), ('channels', 'channels')):
+                    value = getattr(info, attr, None)
+                    if value:
+                        metadata[key] = round(value, 2) if isinstance(value, float) else value
+                for key in ('title', 'artist', 'album', 'date', 'genre', 'comment'):
+                    try:
+                        value = audio.get(key)
+                    except Exception:
+                        value = None
+                    if value:
+                        metadata[key] = str(value[0] if isinstance(value, list) else value)[:300]
+        except ImportError:
+            pass
         except Exception as e:
-            logger.debug(f"Failed to extract metadata from {path}: {e}")
-
+            logger.debug(f"mutagen failed for {path}: {e}")
+        if not metadata:
+            metadata = _ffprobe(path)
         return metadata
-
-    @classmethod
-    def _transcribe_audio(cls, path: Path, duration: Optional[float] = None) -> Optional[str]:
-        """Транскрипция аудио через Whisper"""
-        if not cls._whisper_available:
-            return None
-
-        try:
-            import whisper
-
-            # Check duration limit
-            if duration and duration > cls.MAX_DURATION:
-                logger.warning(
-                    f"Audio file {path.name} is {duration}s long, "
-                    f"limiting transcription to first {cls.MAX_DURATION}s"
-                )
-                # Note: Whisper will process the entire file, but we warn the user
-                # A production system might use ffmpeg to trim first
-
-            # Load model (using base model for speed/quality balance)
-            logger.info(f"Loading Whisper model for {path.name}...")
-            model = whisper.load_model("base")
-
-            # Transcribe
-            logger.info(f"Transcribing {path.name}...")
-            result = model.transcribe(str(path))
-
-            return result.get('text', '').strip()
-
-        except Exception as e:
-            logger.error(f"Whisper transcription failed for {path}: {e}")
-            return None
 
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
-            # Extract metadata first
             metadata = cls._extract_metadata(path)
-
-            # Attempt transcription
-            text = None
-            if cls._whisper_available:
-                duration = metadata.get('duration')
-                text = cls._transcribe_audio(path, duration)
-
-            # If we got neither text nor metadata, it's a failure
-            if text is None and not metadata:
-                return ExtractionResult(
-                    error="No whisper or mutagen available for audio extraction"
-                )
-
-            return ExtractionResult(text=text, metadata=metadata)
-
+            transcript = _transcribe_media(path, metadata.get('duration'))
+            parts = [p for p in (_metadata_text(metadata), transcript) if p]
+            if transcript is not None:
+                metadata['transcribed'] = True
+            if not parts and not metadata:
+                return ExtractionResult(error="No metadata or transcription available "
+                                              "(install mutagen/ffmpeg/openai-whisper)")
+            return ExtractionResult(text='\n\n'.join(parts), metadata=metadata)
         except Exception as e:
             return ExtractionResult(error=f"Audio extraction failed: {e}")
 
@@ -164,206 +220,39 @@ class AudioExtractor(BaseExtractor):
 
 @registry.register
 class VideoExtractor(BaseExtractor):
-    """Извлечение текста из видео файлов через FFmpeg + Whisper"""
+    """Видео: метаданные (ffprobe) + транскрипция аудиодорожки (ffmpeg + Whisper)"""
 
-    extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm']
+    extensions = ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
     priority = 10
 
-    _available: Optional[bool] = None
-    _whisper_available: Optional[bool] = None
-    _ffmpeg_available: Optional[bool] = None
-    _ffprobe_available: Optional[bool] = None
-
-    # Максимальная длительность для транскрипции (секунды)
-    MAX_DURATION = 1800  # 30 minutes
+    MAX_DURATION = 1800
 
     @classmethod
     def is_available(cls) -> bool:
-        if cls._available is None:
-            # Check whisper
-            try:
-                import whisper
-                cls._whisper_available = True
-            except ImportError:
-                cls._whisper_available = False
-
-            # Check ffmpeg
-            try:
-                subprocess.run(
-                    ['ffmpeg', '-version'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True
-                )
-                cls._ffmpeg_available = True
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                cls._ffmpeg_available = False
-
-            # Check ffprobe
-            try:
-                subprocess.run(
-                    ['ffprobe', '-version'],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True
-                )
-                cls._ffprobe_available = True
-            except (subprocess.CalledProcessError, FileNotFoundError):
-                cls._ffprobe_available = False
-
-            # Available if whisper is available (ffmpeg is required for extraction)
-            cls._available = cls._whisper_available
-
-        return cls._available
-
-    @classmethod
-    def _extract_metadata(cls, path: Path) -> dict:
-        """Извлечение метаданных из видео через ffprobe"""
-        metadata = {}
-
-        if not cls._ffprobe_available:
-            return metadata
-
-        try:
-            # Get video info via ffprobe
-            result = subprocess.run(
-                [
-                    'ffprobe',
-                    '-v', 'quiet',
-                    '-print_format', 'json',
-                    '-show_format',
-                    '-show_streams',
-                    str(path)
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True
-            )
-
-            import json
-            data = json.loads(result.stdout)
-
-            # Format info
-            if 'format' in data:
-                fmt = data['format']
-                if 'duration' in fmt:
-                    metadata['duration'] = round(float(fmt['duration']), 2)
-                if 'size' in fmt:
-                    metadata['size'] = int(fmt['size'])
-                if 'bit_rate' in fmt:
-                    metadata['bitrate'] = int(fmt['bit_rate'])
-
-            # Stream info
-            if 'streams' in data:
-                for stream in data['streams']:
-                    if stream.get('codec_type') == 'video':
-                        metadata['video_codec'] = stream.get('codec_name')
-                        if 'width' in stream and 'height' in stream:
-                            metadata['resolution'] = f"{stream['width']}x{stream['height']}"
-                        if 'r_frame_rate' in stream:
-                            metadata['fps'] = stream['r_frame_rate']
-                    elif stream.get('codec_type') == 'audio':
-                        metadata['audio_codec'] = stream.get('codec_name')
-                        if 'sample_rate' in stream:
-                            metadata['sample_rate'] = stream['sample_rate']
-
-        except Exception as e:
-            logger.debug(f"Failed to extract metadata from {path}: {e}")
-
-        return metadata
-
-    @classmethod
-    def _extract_audio_track(cls, video_path: Path, output_path: Path, duration: Optional[float] = None) -> bool:
-        """Извлечение аудио дорожки из видео в WAV"""
-        if not cls._ffmpeg_available:
-            return False
-
-        try:
-            cmd = [
-                'ffmpeg',
-                '-i', str(video_path),
-                '-vn',  # No video
-                '-acodec', 'pcm_s16le',  # PCM 16-bit
-                '-ar', '16000',  # 16kHz (Whisper default)
-                '-ac', '1',  # Mono
-            ]
-
-            # Limit duration if needed
-            if duration and duration > cls.MAX_DURATION:
-                cmd.extend(['-t', str(cls.MAX_DURATION)])
-
-            cmd.extend([
-                '-y',  # Overwrite
-                str(output_path)
-            ])
-
-            subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True
-            )
-
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to extract audio from {video_path}: {e}")
-            return False
-
-    @classmethod
-    def _transcribe_audio(cls, audio_path: Path) -> Optional[str]:
-        """Транскрипция аудио через Whisper"""
-        if not cls._whisper_available:
-            return None
-
-        try:
-            import whisper
-
-            logger.info(f"Loading Whisper model for transcription...")
-            model = whisper.load_model("base")
-
-            logger.info(f"Transcribing audio track...")
-            result = model.transcribe(str(audio_path))
-
-            return result.get('text', '').strip()
-
-        except Exception as e:
-            logger.error(f"Whisper transcription failed: {e}")
-            return None
+        return bool(_tool('ffprobe')) or (bool(_tool('ffmpeg')) and _Whisper.available())
 
     @classmethod
     def extract(cls, path: Path) -> ExtractionResult:
         try:
-            # Extract metadata first
-            metadata = cls._extract_metadata(path)
-
-            # Attempt transcription
-            text = None
-            if cls._whisper_available and cls._ffmpeg_available:
-                duration = metadata.get('duration')
-
-                # Create temp file for audio
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
-                    tmp_path = Path(tmp.name)
-
-                try:
-                    logger.info(f"Extracting audio track from {path.name}...")
-                    if cls._extract_audio_track(path, tmp_path, duration):
-                        text = cls._transcribe_audio(tmp_path)
-                finally:
-                    # Cleanup temp file
-                    if tmp_path.exists():
-                        tmp_path.unlink()
-
-            # If we got neither text nor metadata, it's a failure
-            if text is None and not metadata:
-                return ExtractionResult(
-                    error="No whisper/ffmpeg available for video extraction"
-                )
-
-            return ExtractionResult(text=text, metadata=metadata)
-
+            metadata = _ffprobe(path)
+            transcript = None
+            if _Whisper.available() and _tool('ffmpeg'):
+                wav = _extract_audio(path, ENGINE_CONFIG.media_max_duration)
+                if wav:
+                    try:
+                        transcript = _Whisper.transcribe(wav)
+                    finally:
+                        try:
+                            os.unlink(wav)
+                        except OSError:
+                            pass
+            parts = [p for p in (_metadata_text(metadata), transcript) if p]
+            if transcript is not None:
+                metadata['transcribed'] = True
+            if not parts and not metadata:
+                return ExtractionResult(error="No metadata or transcription available "
+                                              "(install ffmpeg/openai-whisper)")
+            return ExtractionResult(text='\n\n'.join(parts), metadata=metadata)
         except Exception as e:
             return ExtractionResult(error=f"Video extraction failed: {e}")
 

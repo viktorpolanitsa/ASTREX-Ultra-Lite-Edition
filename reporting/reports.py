@@ -5,8 +5,7 @@ ASTREX v3.0 — Report Generator
 """
 
 import csv
-import json
-import io
+import re
 import html as _html
 from pathlib import Path
 from datetime import datetime
@@ -124,8 +123,8 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
   .score {{ color:var(--accent); font-weight:bold; }}
   .entity-tag {{ display:inline-block; background:#1a3a2a; color:#4caf50;
                  padding:2px 8px; border-radius:4px; margin:2px; font-size:11px; }}
-  .snippet {{ color:#999; font-size:12px; max-width:500px;
-              overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .snippet {{ color:#999; font-size:12px; max-width:500px; }}
+  mark {{ background:#665c00; color:#fff; }}
   .timeline {{ position:relative; margin:20px 0; padding-left:30px;
                border-left:2px solid var(--accent); }}
   .timeline-item {{ margin:15px 0; padding:10px 15px; background:var(--card);
@@ -149,27 +148,55 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </body></html>"""
 
 
+_STAT_LABELS = {
+    'total_files': 'Файлов',
+    'matched_files': 'Совпадений',
+    'processed_files': 'Обработано',
+    'errors': 'Ошибок',
+    'duration_seconds': 'Время (сек)',
+    'files_per_second': 'Файлов/сек',
+    'total_size': 'Объём данных',
+    'db_size_mb': 'Размер индекса (МБ)',
+    'entity_links': 'Связей сущностей',
+}
+
+_MARK_RE = re.compile(r'&lt;(/?)mark&gt;')
+_ILLEGAL_XLSX_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+
+
+def _score(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _escape_snippet(text: str, limit: int = 300) -> str:
+    """Экранировать фрагмент, сохранив подсветку <mark> из полнотекстового поиска."""
+    escaped = _html.escape((text or '')[:limit])
+    return _MARK_RE.sub(r'<\1mark>', escaped)
+
+
+def _plain_snippet(text: str) -> str:
+    return (text or '').replace('<mark>', '').replace('</mark>', '')
+
+
 def _render_stats_html(stats: Dict) -> str:
     if not stats:
         return ""
     cards = []
-    labels = {
-        'total_files': 'Файлов',
-        'matched_files': 'Совпадений',
-        'processed_files': 'Обработано',
-        'errors': 'Ошибок',
-        'duration_seconds': 'Время (сек)',
-        'files_per_second': 'Файлов/сек',
-    }
-    for key, label in labels.items():
+    keys = [k for k in _STAT_LABELS if k in stats] + [k for k in stats if k not in _STAT_LABELS]
+    for key in keys:
         val = stats.get(key)
-        if val is not None:
-            if isinstance(val, float):
-                val = f"{val:.1f}"
-            cards.append(
-                f'<div class="stat-card"><div class="stat-value">{val}</div>'
-                f'<div class="stat-label">{label}</div></div>'
-            )
+        if val is None or isinstance(val, (list, dict)):
+            continue
+        if isinstance(val, float):
+            val = f"{val:.1f}"
+        label = _STAT_LABELS.get(key, key)
+        cards.append(
+            f'<div class="stat-card"><div class="stat-value">{_html.escape(str(val))}</div>'
+            f'<div class="stat-label">{_html.escape(label)}</div></div>'
+        )
     return f'<h2>Статистика</h2><div class="stats">{"".join(cards)}</div>'
 
 
@@ -212,8 +239,8 @@ def _render_results_html(results: List[Dict]) -> str:
                             f'{_html.escape(str(etype))}: {_html.escape(str(v))}'
                             f'</span> '
                         )
-        snippet = _html.escape((r.get('snippet', '') or '')[:200])
-        score = r.get('score', 0)
+        snippet = _escape_snippet(r.get('snippet', '') or '', 300)
+        score = _score(r.get('score', 0))
         parts.append(
             f'<tr><td>{i}</td><td>{_html.escape(str(r.get("filename", "?")))}</td>'
             f'<td class="score">{score:.2f}</td>'
@@ -278,17 +305,17 @@ def generate_csv_report(data: ReportData, output_path: str) -> bool:
             for i, r in enumerate(data.results, 1):
                 ents = r.get('entities', {})
                 ents_str = "; ".join(
-                    f"{k}: {', '.join(v[:5])}"
+                    f"{k}: {', '.join(map(str, v[:5]))}"
                     for k, v in ents.items() if isinstance(v, list) and v
                 ) if isinstance(ents, dict) else ""
                 writer.writerow([
                     i,
                     r.get('filename', ''),
                     r.get('path', ''),
-                    f"{r.get('score', 0):.3f}",
+                    f"{_score(r.get('score', 0)):.3f}",
                     ents_str,
-                    (r.get('snippet', '') or '')[:500],
-                    r.get('error', ''),
+                    _plain_snippet(r.get('snippet', '') or '')[:500],
+                    r.get('error', '') or '',
                 ])
         log.info(f"CSV report saved: {output_path}")
         return True
@@ -305,7 +332,7 @@ def generate_excel_report(data: ReportData, output_path: str) -> bool:
     """Генерация Excel отчёта (openpyxl)"""
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.styles import Font, PatternFill
     except ImportError:
         log.error("openpyxl not installed. Run: pip install openpyxl")
         return False
@@ -327,18 +354,21 @@ def generate_excel_report(data: ReportData, output_path: str) -> bool:
             cell.font = header_font
             cell.fill = header_fill
 
+        def clean(value) -> str:
+            return _ILLEGAL_XLSX_RE.sub('', str(value or ''))[:32000]
+
         for i, r in enumerate(data.results, 1):
             ents = r.get('entities', {})
             ents_str = "; ".join(
-                f"{k}: {', '.join(v[:5])}"
+                f"{k}: {', '.join(map(str, v[:5]))}"
                 for k, v in ents.items() if isinstance(v, list) and v
             ) if isinstance(ents, dict) else ""
             ws.cell(row=i + 1, column=1, value=i)
-            ws.cell(row=i + 1, column=2, value=r.get('filename', ''))
-            ws.cell(row=i + 1, column=3, value=r.get('path', ''))
-            ws.cell(row=i + 1, column=4, value=round(r.get('score', 0), 3))
-            ws.cell(row=i + 1, column=5, value=ents_str)
-            ws.cell(row=i + 1, column=6, value=(r.get('snippet', '') or '')[:500])
+            ws.cell(row=i + 1, column=2, value=clean(r.get('filename', '')))
+            ws.cell(row=i + 1, column=3, value=clean(r.get('path', '')))
+            ws.cell(row=i + 1, column=4, value=round(_score(r.get('score', 0)), 3))
+            ws.cell(row=i + 1, column=5, value=clean(ents_str))
+            ws.cell(row=i + 1, column=6, value=clean(_plain_snippet(r.get('snippet', ''))[:500]))
 
         ws.column_dimensions['B'].width = 30
         ws.column_dimensions['C'].width = 50
@@ -355,9 +385,9 @@ def generate_excel_report(data: ReportData, output_path: str) -> bool:
             row = 2
             for etype, vals in data.entities.items():
                 if vals:
-                    ws2.cell(row=row, column=1, value=etype)
+                    ws2.cell(row=row, column=1, value=clean(etype))
                     ws2.cell(row=row, column=2, value=len(vals))
-                    ws2.cell(row=row, column=3, value=", ".join(vals[:30]))
+                    ws2.cell(row=row, column=3, value=clean(", ".join(map(str, vals[:30]))))
                     row += 1
 
         # --- Sheet 3: Stats ---
@@ -368,8 +398,8 @@ def generate_excel_report(data: ReportData, output_path: str) -> bool:
             cell.fill = header_fill
         row = 2
         for k, v in data.stats.items():
-            ws3.cell(row=row, column=1, value=k)
-            ws3.cell(row=row, column=2, value=str(v))
+            ws3.cell(row=row, column=1, value=clean(_STAT_LABELS.get(k, k)))
+            ws3.cell(row=row, column=2, value=clean(v))
             row += 1
 
         wb.save(output_path)

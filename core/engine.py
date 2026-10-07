@@ -4,28 +4,29 @@ ASTREX v3.0 — Scan Engine
 Движок сканирования с индексацией и кешированием
 """
 
-import os
-import sys
 import json
+import os
 import threading
-import queue
-import traceback
-from pathlib import Path
-from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Set, Generator, Callable, Any
+import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from .config import ENGINE_CONFIG, FILE_TYPES, NLP_CONFIG
 from .index import file_index
-from .nlp import extract_entities, calculate_relevance, calculate_relevance_batch, expand_query, _trigram_jaccard
 from .graph import GraphBuilder, Graph
-from extractors import registry, ExtractionResult
+from .logging_setup import get_logger
+
+logger = get_logger("astrex.engine")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DATA CLASSES
 # ═══════════════════════════════════════════════════════════════════════════════
+
+MAX_SNIPPET_CHARS = 5000
+
 
 @dataclass
 class ScanResult:
@@ -38,20 +39,27 @@ class ScanResult:
     entities: Dict[str, List[str]] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
-    
+
     def to_dict(self) -> Dict:
-        # Truncate entity lists to avoid IPC MemoryError when pickling large results
+        # Ограничиваем размер: списки сущностей и "тяжёлые" значения метаданных
         truncated_entities = {
             k: v[:20] if isinstance(v, list) else v
             for k, v in (self.entities or {}).items()
         }
-        # Keep only lightweight metadata fields to reduce pickle size
-        safe_meta = dict(list((self.metadata or {}).items())[:15])
+        safe_meta: Dict[str, Any] = {}
+        for k, v in list((self.metadata or {}).items())[:20]:
+            if isinstance(v, (list, tuple)) and len(v) > 50:
+                v = list(v[:50]) + [f"... (+{len(v) - 50})"]
+            elif isinstance(v, dict) and len(v) > 50:
+                v = dict(list(v.items())[:50])
+            elif isinstance(v, str) and len(v) > 1000:
+                v = v[:1000] + "…"
+            safe_meta[k] = v
         return {
             'path': self.path,
             'filename': self.filename,
             'matched': self.matched,
-            'snippet': self.snippet[:500] if self.snippet else '',
+            'snippet': (self.snippet or '')[:MAX_SNIPPET_CHARS],
             'score': self.score,
             'entities': truncated_entities,
             'metadata': safe_meta,
@@ -68,22 +76,24 @@ class ScanStats:
     errors: int = 0
     skipped: int = 0
     cached: int = 0
+    timeouts: int = 0
     bytes_processed: int = 0
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
-    
+
     @property
     def duration_seconds(self) -> float:
-        if self.start_time and self.end_time:
-            return (self.end_time - self.start_time).total_seconds()
+        if self.start_time:
+            end = self.end_time or datetime.now()
+            return (end - self.start_time).total_seconds()
         return 0.0
-    
+
     @property
     def files_per_second(self) -> float:
         if self.duration_seconds > 0:
             return self.processed_files / self.duration_seconds
         return 0.0
-    
+
     def to_dict(self) -> Dict:
         return {
             'total_files': self.total_files,
@@ -92,10 +102,25 @@ class ScanStats:
             'errors': self.errors,
             'skipped': self.skipped,
             'cached': self.cached,
+            'timeouts': self.timeouts,
             'bytes_processed': self.bytes_processed,
             'duration_seconds': self.duration_seconds,
             'files_per_second': self.files_per_second
         }
+
+
+@dataclass
+class SearchOptions:
+    """Параметры для ScanEngine.search() (Python API)."""
+    use_index: bool = True
+    use_fuzzy: bool = True
+    use_morphology: bool = True
+    extract_entities: bool = True
+    build_graph: bool = True
+    min_score: float = 0.1
+    max_results: int = 500
+    max_workers: Optional[int] = None
+    extensions: Optional[Set[str]] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -114,345 +139,417 @@ class MessageType:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SCAN ENGINE
+# WORKER-SIDE FUNCTIONS (run in child processes)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _process_file_worker(
-    file_path_str: str,
-    query_lower: str,
-    query_forms: Set[str],
-    use_nlp: bool,
-    use_cache: bool,
-    fuzzy_search: bool,
-    max_ram_per_worker_mb: int = 0,
-) -> Optional[str]:
-    """
-    Top-level function for ProcessPoolExecutor.
-    Runs in a separate process — if it crashes, the main process survives.
+_PLUGINS_LOADED = False
 
-    Returns a path to a temp JSON file containing ScanResult.to_dict(), or None.
-    Using a file path (~60 bytes) instead of the full dict avoids
-    IPC MemoryError: even a severely OOM worker can pickle a short string.
-    The main process reads and deletes the temp file.
+
+def ensure_plugins_loaded() -> None:
+    """Загрузить плагины в текущем процессе (один раз), если включена автозагрузка.
+
+    Нужно и в главном процессе: от зарегистрированных экстракторов зависит,
+    какие расширения файлов собирает сканер (default_extensions).
     """
+    global _PLUGINS_LOADED
+    if _PLUGINS_LOADED or not ENGINE_CONFIG.plugins_autoload:
+        return
+    _PLUGINS_LOADED = True
+    try:
+        from .plugins import plugin_manager
+        plugin_manager.load_all(quiet=True)
+    except Exception as e:
+        logger.debug(f"Plugin autoload failed: {e}")
+
+
+def _worker_init(cpu_affinity: Optional[List[int]], load_plugins: bool) -> None:
+    """Инициализация процесса-воркера."""
+    # Не плодить потоки BLAS/OpenMP в каждом воркере
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if cpu_affinity:
+        try:
+            os.sched_setaffinity(0, cpu_affinity)
+        except (AttributeError, OSError):
+            pass
+    if load_plugins:
+        ensure_plugins_loaded()
+
+
+def _make_snippet(text: str, pos: int, length: int, window: int) -> str:
+    """Фрагмент текста вокруг совпадения (совпадение всегда внутри)."""
+    start = max(0, pos - window)
+    end = min(len(text), pos + max(length, 1) + window)
+    # Не резать слова по краям
+    if start > 0:
+        space = text.rfind(' ', max(0, start - 40), start)
+        if space != -1:
+            start = space + 1
+    if end < len(text):
+        space = text.find(' ', end, min(len(text), end + 40))
+        if space != -1:
+            end = space
+    snippet = text[start:end]
+    if len(snippet) > MAX_SNIPPET_CHARS:
+        rel = pos - start
+        half = MAX_SNIPPET_CHARS // 2
+        snippet = snippet[max(0, rel - half): max(0, rel - half) + MAX_SNIPPET_CHARS]
+    return snippet.strip()
+
+
+def _process_file_worker(file_path_str: str, matcher_data: Dict[str, Any], opts: Dict[str, Any]) -> str:
+    """Обработать один файл в процессе-воркере.
+
+    Returns:
+        JSON-строку с ScanResult.to_dict() + служебные поля
+        (короткая строка безопасно передаётся через IPC).
+    """
+    from extractors import registry
+    from .nlp import QueryMatcher, FuzzyMatcher, extract_entities
+
     file_path = Path(file_path_str)
+    abs_path = str(file_path.absolute())
+    result = ScanResult(path=abs_path, filename=file_path.name)
+    info: Dict[str, Any] = {'from_cache': False, 'size': 0}
 
-    result = ScanResult(
-        path=str(file_path.absolute()),
-        filename=file_path.name
-    )
+    def done() -> str:
+        payload = result.to_dict()
+        payload['_info'] = info
+        return json.dumps(payload, ensure_ascii=False, default=str)
 
     try:
         stat = file_path.stat()
-        size = stat.st_size
-        mtime = stat.st_mtime
-
+        size, mtime = stat.st_size, stat.st_mtime
+        info['size'] = size
         result.metadata['size'] = size
         result.metadata['mtime'] = mtime
 
-        # Check cache
-        text = None
-        entities = None
+        use_cache = opts.get('use_cache', True)
+        use_nlp = opts.get('use_nlp', True)
+        max_chars = opts.get('max_extracted_chars', ENGINE_CONFIG.max_extracted_chars)
+
+        text: Optional[str] = None
+        entities: Optional[Dict[str, List[str]]] = None
         from_cache = False
 
         if use_cache:
             try:
-                cached = file_index.get_file(str(file_path.absolute()))
-                if cached and not file_index.file_needs_update(
-                    str(file_path.absolute()), mtime, size
-                ):
-                    text = cached.extracted_text
-                    entities = cached.entities
-                    from_cache = True
+                meta = file_index.get_file_meta(abs_path)
+                if meta and meta.mtime == mtime and meta.size == size and meta.has_text:
+                    cached = file_index.get_file(abs_path)
+                    if cached is not None and cached.extracted_text is not None:
+                        text = cached.extracted_text
+                        # NULL = сущности не извлекались (не путать с "пусто")
+                        entities = cached.entities if cached.entities_computed else None
+                        from_cache = True
             except Exception:
                 pass
+        info['from_cache'] = from_cache
 
-        # Extract text if not cached
         if text is None:
-            try:
-                extraction = registry.extract(file_path)
-            except Exception as e:
-                result.error = f"Extraction failed: {type(e).__name__}: {e}"
-                return _serialize_result(result.to_dict())
-
+            extraction = registry.extract(file_path)
             if extraction.error:
                 result.error = extraction.error
-                return _serialize_result(result.to_dict())
-
-            text = extraction.full_text
-            result.metadata.update(extraction.metadata)
+                return done()
+            text = extraction.full_text or ''
+            if len(text) > max_chars:
+                text = text[:max_chars]
+                result.metadata['text_truncated'] = True
+            for k, v in (extraction.metadata or {}).items():
+                result.metadata.setdefault(k, v)
 
         if not text:
-            return _serialize_result(result.to_dict())
+            return done()
 
-        # Quick check: does text contain any query form?
-        text_lower = text.lower()
+        matcher = QueryMatcher.from_dict(matcher_data)
+        match = matcher.find(text)
+        match_kind = match.kind if match else None
 
-        match_found = False
-        match_pos = -1
+        if match is None and opts.get('fuzzy_search', True):
+            ok, pos, fscore = FuzzyMatcher.fuzzy_find_in_text(
+                matcher.query, text, threshold=opts.get('fuzzy_threshold'))
+            if ok:
+                from .nlp import MatchInfo
+                match = MatchInfo('fuzzy', pos, len(matcher.query), 1, fscore)
+                match_kind = 'fuzzy'
 
-        # Check all morphological forms (exact substring match — fastest)
-        for form in query_forms:
-            pos = text_lower.find(form)
-            if pos != -1:
-                match_found = True
-                if match_pos == -1 or pos < match_pos:
-                    match_pos = pos
-                break
+        cache_entities = entities
+        if match is not None:
+            result.matched = True
+            result.snippet = _make_snippet(text, match.pos, match.length,
+                                           opts.get('context_window', ENGINE_CONFIG.context_window))
+            result.metadata['match_type'] = match_kind
+            result.metadata['match_count'] = match.count
+            if match_kind == 'fuzzy':
+                result.metadata['fuzzy_score'] = round(match.score, 1)
 
-        # Morphology sub-string search (partial word matches via stems)
-        if not match_found and fuzzy_search:
-            try:
-                from .nlp import morph_analyzer
-                stem = morph_analyzer.normalize(query_lower)
-                if stem and len(stem) >= 3 and stem != query_lower:
-                    pos = text_lower.find(stem)
-                    if pos != -1:
-                        match_found = True
-                        match_pos = pos
-            except Exception:
-                pass
-
-        # Fuzzy check if no exact match — sliding window approach
-        if not match_found and fuzzy_search:
-            try:
-                from .nlp import FuzzyMatcher
-                if FuzzyMatcher.is_available():
-                    # Sliding window fuzzy search — more reliable than split('.')
-                    search_text = text[:20000]
-                    window_size = 200
-                    step_size = 100
-                    best_ratio = 0
-                    best_pos = -1
-
-                    for win_start in range(0, len(search_text) - len(query_lower), step_size):
-                        win_end = min(win_start + window_size, len(search_text))
-                        window = search_text[win_start:win_end].lower()
-                        ratio = FuzzyMatcher.wratio(query_lower, window)
-                        if ratio > best_ratio:
-                            best_ratio = ratio
-                            best_pos = win_start
-                        if best_ratio >= ENGINE_CONFIG.fuzzy_threshold:
-                            break
-
-                    if best_ratio >= ENGINE_CONFIG.fuzzy_threshold:
-                        match_found = True
-                        match_pos = best_pos
-                else:
-                    # Fallback: trigram Jaccard when rapidfuzz is unavailable
-                    search_text = text[:20000].lower()
-                    window_size = 200
-                    step_size = 100
-                    best_ratio = 0
-                    best_pos = -1
-
-                    for win_start in range(0, len(search_text) - len(query_lower), step_size):
-                        win_end = min(win_start + window_size, len(search_text))
-                        window = search_text[win_start:win_end]
-                        ratio = _trigram_jaccard(query_lower, window) * 100
-                        if ratio > best_ratio:
-                            best_ratio = ratio
-                            best_pos = win_start
-                        if best_ratio >= ENGINE_CONFIG.fuzzy_threshold:
-                            break
-
-                    if best_ratio >= ENGINE_CONFIG.fuzzy_threshold:
-                        match_found = True
-                        match_pos = best_pos
-            except Exception:
-                pass
-
-        if not match_found:
-            # Cache the extracted text for future searches
-            if use_cache and not from_cache:
-                try:
-                    _cache_file_standalone(file_path, size, mtime, text, None)
-                except Exception:
-                    pass
-            return _serialize_result(result.to_dict())
-
-        # Match found
-        result.matched = True
-
-        # Extract snippet
-        window = ENGINE_CONFIG.context_window
-        start = max(0, match_pos - window)
-        end = min(len(text), match_pos + len(query_lower) + window)
-        result.snippet = text[start:end].strip()
-
-        # NLP analysis
-        if use_nlp:
-            try:
-                result.score = calculate_relevance(result.snippet, query_lower)
-            except Exception:
-                result.score = 0.5
-
-            try:
+            if use_nlp:
                 if entities is None:
-                    entities = extract_entities(text[:NLP_CONFIG.max_text_length])
-                result.entities = entities
-            except Exception:
-                pass
-        else:
-            query_count = text_lower.count(query_lower)
-            result.score = min(1.0, 0.5 + query_count * 0.1)
+                    try:
+                        entities = extract_entities(text[:NLP_CONFIG.max_text_length])
+                    except Exception:
+                        entities = None
+                result.entities = entities or {}
 
-        # Cache result
-        if use_cache and not from_cache:
+        # Кеширование
+        if use_cache:
             try:
-                _cache_file_standalone(file_path, size, mtime, text, entities)
+                if not from_cache:
+                    file_index.upsert_file(
+                        path=abs_path,
+                        filename=file_path.name,
+                        extension=file_path.suffix.lower(),
+                        size=size,
+                        mtime=mtime,
+                        extracted_text=text,
+                        entities=entities,
+                    )
+                elif entities is not None and cache_entities is None:
+                    file_index.update_entities(abs_path, entities)
             except Exception:
                 pass
 
-        return _serialize_result(result.to_dict())
+        return done()
 
     except MemoryError:
         result.error = "MemoryError: file too large"
-        return _serialize_result(result.to_dict())
+        return done()
     except RecursionError:
         result.error = "RecursionError: file structure too deep"
-        return _serialize_result(result.to_dict())
+        return done()
     except Exception as e:
         result.error = f"{type(e).__name__}: {e}"
-        return _serialize_result(result.to_dict())
+        return done()
 
 
-def _index_file_worker(file_path_str: str, extract_ents: bool) -> tuple:
-    """Top-level indexing worker for ProcessPoolExecutor."""
+def _index_file_worker(file_path_str: str, extract_ents: bool, max_chars: int) -> Tuple[str, str, Optional[str]]:
+    """Проиндексировать один файл (в процессе-воркере).
+
+    Returns:
+        (path, status, error) где status: 'cached' | 'indexed' | 'empty' | 'error'
+    """
+    from extractors import registry
+    from .nlp import extract_entities
+
+    file_path = Path(file_path_str)
+    path_str = str(file_path.absolute())
     try:
-        file_path = Path(file_path_str)
         stat = file_path.stat()
-        path_str = str(file_path.absolute())
-
-        # Check if needs update
         if not file_index.file_needs_update(path_str, stat.st_mtime, stat.st_size):
-            return (True, False)
+            return (path_str, 'cached', None)
 
-        # Extract text
         extraction = registry.extract(file_path)
         if extraction.error:
-            return (False, True)
+            return (path_str, 'error', extraction.error)
 
-        text = extraction.full_text
+        text = (extraction.full_text or '')[:max_chars]
 
-        # Extract entities
         entities = None
         if extract_ents and text:
             try:
                 entities = extract_entities(text[:NLP_CONFIG.max_text_length])
             except Exception:
-                pass
+                entities = None
 
-        # Cache
         file_index.upsert_file(
             path=path_str,
             filename=file_path.name,
             extension=file_path.suffix.lower(),
             size=stat.st_size,
             mtime=stat.st_mtime,
-            extracted_text=text[:500000] if text else None,
+            extracted_text=text if text else None,
             entities=entities
         )
+        return (path_str, 'indexed' if text else 'empty', None)
 
-        return (False, False)
-
-    except Exception:
-        return (False, True)
+    except Exception as e:
+        return (path_str, 'error', f"{type(e).__name__}: {e}")
 
 
-def _cache_file_standalone(file_path, size, mtime, text, entities):
-    """Standalone cache function for use in worker processes."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cleanup_stale_temp_dirs() -> None:
+    """Удалить временные каталоги воркеров, процессы которых уже не существуют."""
+    import shutil
+    from .config import TEMP_PATH
     try:
-        file_index.upsert_file(
-            path=str(file_path.absolute()),
-            filename=file_path.name,
-            extension=file_path.suffix.lower(),
-            size=size,
-            mtime=mtime,
-            extracted_text=text[:500000] if text else None,
-            entities=entities
-        )
-    except Exception:
+        for entry in TEMP_PATH.iterdir():
+            if not entry.is_dir() or not entry.name.startswith('w'):
+                continue
+            try:
+                pid = int(entry.name[1:])
+            except ValueError:
+                continue
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except ProcessLookupError:
+                alive = False
+            except PermissionError:
+                alive = True
+            if not alive:
+                shutil.rmtree(entry, ignore_errors=True)
+    except OSError:
         pass
 
 
-def _serialize_result(result_dict: Optional[Dict]) -> Optional[str]:
-    """
-    Serialize result dict to a JSON string for IPC.
+def _resolved_excludes(paths) -> List[str]:
+    result = []
+    for p in paths or ():
+        if not p:
+            continue
+        try:
+            result.append(os.path.realpath(os.path.expanduser(p)))
+        except OSError:
+            continue
+    return result
 
-    Workers return a JSON string through IPC instead of the full dict.
-    JSON strings are lightweight and always picklable.
 
-    Returns None on complete failure (main process treats it as no result).
-    """
-    if result_dict is None:
-        return None
+def _is_under(path: str, roots: List[str]) -> bool:
+    for root in roots:
+        if path == root or path.startswith(root.rstrip('/') + '/'):
+            return True
+    return False
+
+
+def default_extensions() -> Set[str]:
+    """Расширения для сканирования: FILE_TYPES + всё, что умеют доступные
+    экстракторы (включая подключённые плагины)."""
+    exts = set(FILE_TYPES.all_supported)
     try:
-        return json.dumps(result_dict, ensure_ascii=False, default=str)
+        from extractors import registry
+        exts.update(e for e in registry.supported_extensions()
+                    if e.startswith('.') and e.count('.') == 1)
     except Exception:
-        return None
+        pass
+    return exts
 
+
+def collect_files(
+    folder: Path,
+    extensions,
+    exclude_paths=None,
+    skip_hidden_dirs: bool = True,
+    max_file_size: int = 0,
+    should_stop: Callable[[], bool] = lambda: False,
+    stats: Optional[ScanStats] = None,
+) -> List[Path]:
+    """Собрать файлы для обработки."""
+    files: List[Path] = []
+    excludes = _resolved_excludes(exclude_paths)
+    folder_real = os.path.realpath(str(folder))
+
+    def on_error(err):
+        logger.debug(f"Cannot read directory: {err}")
+
+    for root, dirs, filenames in os.walk(folder_real, onerror=on_error):
+        if should_stop():
+            break
+        kept = []
+        for d in dirs:
+            if skip_hidden_dirs and d.startswith('.'):
+                continue
+            full = os.path.join(root, d)
+            if excludes and _is_under(full, excludes):
+                continue
+            kept.append(d)
+        dirs[:] = kept
+
+        for filename in filenames:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in extensions:
+                continue
+            file_path = os.path.join(root, filename)
+            try:
+                size = os.stat(file_path).st_size
+            except OSError:
+                continue
+            if size == 0:
+                continue
+            if max_file_size and size > max_file_size:
+                if stats is not None:
+                    stats.skipped += 1
+                continue
+            files.append(Path(file_path))
+    return files
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCAN ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ScanEngine:
     """
     Движок сканирования ASTREX.
-    
+
     Features:
-    - Многопоточное сканирование
+    - Параллельная обработка в процессах (с таймаутом и лимитом памяти на файл)
     - Кеширование извлечённого текста в SQLite
     - Инкрементальное обновление (только изменённые файлы)
-    - NLP анализ с морфологией и fuzzy search
+    - Морфология, нечёткий поиск, NER
     - Построение графа связей
     - Real-time callbacks для GUI
     """
-    
+
     def __init__(
         self,
         callback: Optional[Callable[[str, Dict], None]] = None,
         use_cache: bool = True,
         use_nlp: bool = True,
         build_graph: bool = True,
-        fuzzy_search: bool = True
+        fuzzy_search: bool = True,
+        use_morphology: bool = True,
+        apply_limits: bool = True,
+        exclude_paths: Optional[List[str]] = None,
     ):
         self.callback = callback or self._default_callback
         self.use_cache = use_cache
         self.use_nlp = use_nlp
         self.build_graph = build_graph
         self.fuzzy_search = fuzzy_search
-        
+        self.use_morphology = use_morphology
+        self.apply_limits = apply_limits
+        self.exclude_paths = list(exclude_paths or [])
+
         self.stats = ScanStats()
         self.results: List[ScanResult] = []
         self.graph_builder = GraphBuilder() if build_graph else None
-        
+
         self._stop_event = threading.Event()
         self._lock = threading.RLock()
-        self._batch_queue: queue.Queue = queue.Queue()
-        
-        # Expanded query forms (morphology)
-        self._query_forms: Set[str] = set()
-    
+
     def _default_callback(self, msg_type: str, data: Dict) -> None:
-        """Default callback - print JSON to stdout"""
-        print(json.dumps({"type": msg_type, **data}, ensure_ascii=False), flush=True)
-    
+        """Колбэк по умолчанию — журнал (а не JSON в stdout: при использовании
+        ScanEngine как библиотеки вывод программы засорялся событиями)."""
+        if msg_type == MessageType.ERROR:
+            target = f" [{data['file']}]" if data.get('file') else ''
+            logger.warning(f"{data.get('msg', '')}{target}")
+        elif msg_type == MessageType.STATUS:
+            logger.info(data.get('msg', ''))
+        else:
+            logger.debug(f"{msg_type}: {str(data)[:200]}")
+
     def emit(self, msg_type: str, data: Dict) -> None:
         """Emit message to callback"""
         try:
             self.callback(msg_type, data)
-        except Exception:
-            pass
-    
+        except Exception as e:
+            logger.debug(f"Callback failed: {e}")
+
     def stop(self) -> None:
         """Stop scanning"""
         self._stop_event.set()
-    
+
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
-    
+
     # ═══════════════════════════════════════════════════════════════════════════
     # MAIN SCAN
     # ═══════════════════════════════════════════════════════════════════════════
-    
+
     def scan(
         self,
         folder: str,
@@ -462,55 +559,60 @@ class ScanEngine:
     ) -> List[ScanResult]:
         """
         Выполнить сканирование.
-        
+
         Args:
             folder: Директория для сканирования
             query: Поисковый запрос
             extensions: Фильтр по расширениям (None = все поддерживаемые)
-            max_workers: Количество потоков (None = auto)
-        
+            max_workers: Количество процессов-воркеров (None = авто)
+
         Returns:
-            Список результатов
+            Список совпавших файлов, отсортированный по релевантности
         """
+        from .nlp import build_query_matcher, relevance_calculator, calculate_relevance_batch
+        from .resource_guard import (apply_resource_limits, calculate_safe_workers,
+                                     is_ram_high, affinity_target)
+        from .workerpool import WorkerPool
+
         self._stop_event.clear()
         self.stats = ScanStats()
         self.results = []
-        
+
         if self.graph_builder:
             self.graph_builder.clear()
-        
-        folder_path = Path(folder).resolve()
+
+        folder_path = Path(folder).expanduser().resolve()
         if not folder_path.exists():
             self.emit(MessageType.ERROR, {"msg": f"Folder not found: {folder}"})
             return []
-        
-        # Prepare query
-        query_lower = query.lower()
-        
-        # Expand query with morphological forms
-        if self.fuzzy_search:
-            self._query_forms = expand_query(query)
-            self.emit(MessageType.STATUS, {
-                "msg": f"Query expanded: {len(self._query_forms)} forms"
-            })
-        else:
-            self._query_forms = {query_lower}
-        
-        # Apply resource limits (CPU affinity, GPU memory cap)
-        try:
-            from .resource_guard import apply_resource_limits, calculate_safe_workers
-            apply_resource_limits()
-            max_workers = calculate_safe_workers(max_workers)
-        except Exception:
-            if max_workers is None:
-                cpu_count = os.cpu_count() or 4
-                max_workers = max(1, cpu_count)
+        if not folder_path.is_dir():
+            self.emit(MessageType.ERROR, {"msg": f"Not a directory: {folder}"})
+            return []
 
+        matcher = build_query_matcher(query, use_morphology=self.use_morphology)
+        if matcher.is_empty:
+            self.emit(MessageType.ERROR, {"msg": "Query contains no searchable words"})
+            return []
+        forms = matcher.all_forms()
         self.emit(MessageType.STATUS, {
-            "msg": f"ASTREX: Initializing scan (workers={max_workers})"
+            "msg": f"Query: {len(matcher.terms)} term(s), {len(forms)} word forms"
         })
 
-        # GPU status
+        # Воркеры получают ограниченный набор ядер в инициализаторе (forkserver
+        # не наследует affinity главного процесса); сам главный процесс
+        # ограничивается только при apply_limits (CLI), но не в веб-сервере.
+        cpu_affinity = affinity_target(ENGINE_CONFIG.max_cpu_percent)
+        if self.apply_limits:
+            try:
+                apply_resource_limits()
+            except Exception:
+                pass
+
+        per_worker = ENGINE_CONFIG.est_ram_per_worker_mb if self.use_nlp else max(
+            128, ENGINE_CONFIG.est_ram_per_worker_mb // 4)
+        max_workers = calculate_safe_workers(max_workers, per_worker_mb=per_worker)
+
+        # GPU status (информационно; модели в воркерах работают на CPU)
         try:
             from .gpu import gpu_info_dict
             gpu_info = gpu_info_dict()
@@ -520,254 +622,230 @@ class ScanEngine:
             })
         except Exception:
             self.emit(MessageType.STATUS, {"msg": "GPU: not available, using CPU"})
-        
-        # Collect files
+
         self.stats.start_time = datetime.now()
-        
+
         if extensions is None:
-            extensions = FILE_TYPES.all_supported
-        
-        files = self._collect_files(folder_path, extensions)
+            ensure_plugins_loaded()
+            extensions = default_extensions()
+
+        excludes = list(ENGINE_CONFIG.exclude_paths) + self.exclude_paths
+        files = collect_files(
+            folder_path, extensions, exclude_paths=excludes,
+            skip_hidden_dirs=ENGINE_CONFIG.skip_hidden_dirs,
+            max_file_size=ENGINE_CONFIG.max_file_size,
+            should_stop=self.is_stopped, stats=self.stats,
+        )
         self.stats.total_files = len(files)
-        
+
         self.emit(MessageType.STATUS, {
-            "msg": f"Files to analyze: {len(files)}"
+            "msg": f"Files to analyze: {len(files)} (workers={min(max_workers, max(1, len(files)))})"
         })
-        
-        if not files:
+
+        if not files or self.is_stopped():
             self.stats.end_time = datetime.now()
+            self.emit(MessageType.STATS, self.stats.to_dict())
             return []
-        
-        # Import resource guard helpers
-        try:
-            from .resource_guard import wait_for_ram, get_ram_usage_percent
-            _has_guard = True
-        except Exception:
-            _has_guard = False
+
+        _cleanup_stale_temp_dirs()
+
+        opts = {
+            'use_cache': self.use_cache,
+            'use_nlp': self.use_nlp,
+            'fuzzy_search': self.fuzzy_search,
+            'fuzzy_threshold': ENGINE_CONFIG.fuzzy_threshold,
+            'context_window': ENGINE_CONFIG.context_window,
+            'max_extracted_chars': ENGINE_CONFIG.max_extracted_chars,
+        }
+        matcher_data = matcher.to_dict()
+        tasks = ((fp, (str(fp), matcher_data, opts)) for fp in files)
 
         ram_limit = ENGINE_CONFIG.max_ram_percent
-        spawn_delay = ENGINE_CONFIG.worker_spawn_delay
-        worker_mem_limit = ENGINE_CONFIG.max_ram_per_worker_mb
+        ram_state = {'high': False, 'checked': 0.0}
 
-        # Scan with process pool — throttled submission to prevent OOM.
-        # NOTE: we intentionally avoid `with ProcessPoolExecutor` because its
-        # __exit__ calls shutdown(wait=True) which re-raises BrokenProcessPool
-        # after a worker OOM-crashes during IPC pickling. Instead we manage
-        # the executor explicitly and always shut down with wait=False.
-        executor = ProcessPoolExecutor(max_workers=max_workers)
-        futures = {}
+        def can_submit(pool: WorkerPool) -> bool:
+            # При нехватке RAM обрабатываем по одному файлу, но не прерываем скан
+            if ram_limit <= 0:
+                return True
+            now = time.monotonic()
+            if now - ram_state['checked'] > 0.5:
+                ram_state['checked'] = now
+                high = is_ram_high(ram_limit)
+                if high and not ram_state['high']:
+                    self.emit(MessageType.STATUS, {
+                        "msg": f"RAM usage >= {ram_limit}%: throttling to one file at a time"})
+                ram_state['high'] = high
+            return not ram_state['high'] or pool.busy_count == 0
+
+        last_progress = 0.0
+        pool = WorkerPool(
+            _process_file_worker,
+            n_workers=min(max_workers, len(files)),
+            initializer=_worker_init,
+            initargs=(cpu_affinity, ENGINE_CONFIG.plugins_autoload),
+            task_timeout=ENGINE_CONFIG.file_timeout,
+            max_rss_mb=ENGINE_CONFIG.max_ram_per_worker_mb,
+        )
 
         try:
-            for fp in files:
-                if self.is_stopped():
-                    break
+            for res in pool.run(tasks, should_stop=self.is_stopped, can_submit=can_submit):
+                self.stats.processed_files += 1
 
-                # Throttle: wait if RAM is too high
-                if _has_guard and ram_limit > 0:
-                    ram_pct = get_ram_usage_percent()
-                    if ram_pct >= ram_limit:
-                        self.emit(MessageType.STATUS, {
-                            "msg": f"RAM {ram_pct:.0f}% >= {ram_limit}%, pausing..."
-                        })
-                        if not wait_for_ram(ram_limit, poll_interval=2.0, timeout=120.0):
-                            self.emit(MessageType.ERROR, {
-                                "msg": "RAM limit exceeded too long, stopping scan"
-                            })
-                            break
-
-                try:
-                    future = executor.submit(
-                        _process_file_worker,
-                        str(fp),
-                        query_lower,
-                        self._query_forms,
-                        self.use_nlp,
-                        self.use_cache,
-                        self.fuzzy_search,
-                        worker_mem_limit,
-                    )
-                    futures[future] = fp
-                except Exception:
-                    # Pool already broken — stop submitting
+                if not res.ok:
                     self.stats.errors += 1
-                    break
+                    if res.kind == 'timeout':
+                        self.stats.timeouts += 1
+                    self.emit(MessageType.ERROR, {"msg": res.error, "file": str(res.key)})
+                else:
+                    self._handle_result(res.value, query, relevance_calculator)
 
-                # Small delay between submissions to avoid spike
-                if spawn_delay > 0:
-                    import time
-                    time.sleep(spawn_delay)
-
-            for i, future in enumerate(as_completed(futures)):
-                if self.is_stopped():
-                    for f in futures:
-                        f.cancel()
-                    break
-
-                try:
-                    # Worker returns a JSON string (or None).
-                    json_str = future.result(timeout=120)
-                    result_dict = None
-
-                    if json_str:
-                        try:
-                            result_dict = json.loads(json_str)
-                        except Exception:
-                            result_dict = None
-
-                    if result_dict:
-                        self.stats.processed_files += 1
-
-                        is_matched = result_dict.get('matched', False)
-                        has_error = result_dict.get('error')
-
-                        if is_matched:
-                            sr = ScanResult(
-                                path=result_dict.get('path', ''),
-                                filename=result_dict.get('filename', ''),
-                                matched=True,
-                                snippet=result_dict.get('snippet', ''),
-                                score=result_dict.get('score', 0.0),
-                                entities=result_dict.get('entities', {}),
-                                metadata=result_dict.get('metadata', {}),
-                                error=has_error,
-                            )
-                            self.results.append(sr)
-                            self.stats.matched_files += 1
-
-                            # Build graph in main process (not picklable)
-                            if self.graph_builder and sr.entities:
-                                try:
-                                    self.graph_builder.build_from_entities(
-                                        sr.entities, sr.snippet, sr.path
-                                    )
-                                except Exception:
-                                    pass
-
-                            self.emit(MessageType.MATCH, result_dict)
-
-                        if has_error:
-                            self.stats.errors += 1
-
-                except Exception as e:
-                    self.stats.errors += 1
-                    self.emit(MessageType.ERROR, {
-                        "msg": f"Worker error: {type(e).__name__}: {e}",
-                        "file": str(futures.get(future, ''))
-                    })
-
-                # Progress update
-                if i % 50 == 0 or i == len(futures) - 1:
+                now = time.monotonic()
+                if now - last_progress >= 0.5 or self.stats.processed_files == self.stats.total_files:
+                    last_progress = now
                     self.emit(MessageType.PROGRESS, {
                         "current": self.stats.processed_files,
                         "total": self.stats.total_files,
                         "matched": self.stats.matched_files,
-                        "cached": self.stats.cached
+                        "cached": self.stats.cached,
+                        "errors": self.stats.errors,
                     })
-
         except Exception as pool_err:
-            # BrokenProcessPool — a worker died (OOM during IPC pickling).
-            # Return partial results gathered so far instead of failing.
             self.emit(MessageType.ERROR, {
-                "msg": f"Worker pool broken (OOM in subprocess): {pool_err}. "
-                       f"Returning {len(self.results)} partial results. "
-                       f"Try --no-nlp or --workers 1 to reduce memory pressure."
+                "msg": f"Worker pool failure: {type(pool_err).__name__}: {pool_err}. "
+                       f"Returning {len(self.results)} partial results."
             })
         finally:
-            # Always shut down without waiting — avoids re-raising BrokenProcessPool
-            try:
-                executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        
-        # Finalize
-        self.stats.end_time = datetime.now()
-        
-        # Batch re-score with SBERT if available and NLP enabled
-        if self.use_nlp and self.results:
-            try:
-                snippets = [r.snippet[:2000] for r in self.results]
-                batch_scores = calculate_relevance_batch(snippets, query)
-                if batch_scores and len(batch_scores) == len(self.results):
-                    for r, score in zip(self.results, batch_scores):
-                        r.score = score
-            except Exception:
-                pass  # fallback to per-file scores
+            pool.terminate()
 
-        # Sort results by score
+        self.stats.end_time = datetime.now()
+
+        if self.is_stopped():
+            self.emit(MessageType.STATUS, {"msg": "Scan stopped by user"})
+
+        # Итоговая оценка релевантности (ключевые слова + SBERT при NLP)
+        if self.results:
+            try:
+                snippets = [r.snippet for r in self.results]
+                scores = calculate_relevance_batch(snippets, query, use_semantic=self.use_nlp)
+                if len(scores) == len(self.results):
+                    for r, score in zip(self.results, scores):
+                        if r.metadata.get('match_type') == 'fuzzy':
+                            score = max(score, 0.3)
+                        r.score = round(max(score, 0.1), 4)
+            except Exception as e:
+                logger.debug(f"Batch scoring failed: {e}")
+
         self.results.sort(key=lambda x: x.score, reverse=True)
-        
-        # Emit final stats
+
         self.emit(MessageType.STATS, self.stats.to_dict())
-        
-        # Emit graph if built
+
         if self.graph_builder and self.graph_builder.get_graph().nodes:
             graph = self.graph_builder.get_graph()
-            self.emit(MessageType.GRAPH, graph.to_dict())
-        
+            self.emit(MessageType.GRAPH, graph.to_dict(max_edges=2000))
+
         return self.results
-    
-    # ═══════════════════════════════════════════════════════════════════════════
-    # FILE COLLECTION
-    # ═══════════════════════════════════════════════════════════════════════════
-    
-    def _collect_files(
-        self, 
-        folder: Path, 
-        extensions: Set[str]
-    ) -> List[Path]:
-        """Collect files for scanning"""
-        files = []
-        
+
+    def _handle_result(self, json_str: Optional[str], query: str, relevance) -> None:
+        if not json_str:
+            self.stats.errors += 1
+            return
         try:
-            for root, dirs, filenames in os.walk(folder):
-                # Skip hidden directories
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
-                
-                for filename in filenames:
-                    if self.is_stopped():
-                        break
-                    
-                    # Check extension
-                    ext = Path(filename).suffix.lower()
-                    if ext not in extensions:
-                        continue
-                    
-                    file_path = Path(root) / filename
-                    
-                    # Check size
-                    try:
-                        size = file_path.stat().st_size
-                        if size > ENGINE_CONFIG.max_file_size:
-                            self.stats.skipped += 1
-                            continue
-                        if size == 0:
-                            continue
-                    except OSError:
-                        continue
-                    
-                    files.append(file_path)
-        
-        except PermissionError:
-            pass
-        
-        return files
-    
-    # _process_file and _cache_file removed — replaced by
-    # top-level _process_file_worker() for ProcessPoolExecutor isolation
-    
+            result_dict = json.loads(json_str)
+        except (TypeError, ValueError):
+            self.stats.errors += 1
+            return
+
+        info = result_dict.pop('_info', {}) or {}
+        if info.get('from_cache'):
+            self.stats.cached += 1
+        self.stats.bytes_processed += int(info.get('size') or 0)
+
+        if result_dict.get('error'):
+            self.stats.errors += 1
+
+        if not result_dict.get('matched'):
+            return
+
+        sr = ScanResult(
+            path=result_dict.get('path', ''),
+            filename=result_dict.get('filename', ''),
+            matched=True,
+            snippet=result_dict.get('snippet', ''),
+            entities=result_dict.get('entities') or {},
+            metadata=result_dict.get('metadata') or {},
+            error=result_dict.get('error'),
+        )
+        # Предварительная оценка (без нейросетей) — для потоковой выдачи
+        try:
+            sr.score = round(max(relevance.keyword_score(sr.snippet, query), 0.1), 4)
+        except Exception:
+            sr.score = 0.5
+        with self._lock:
+            self.results.append(sr)
+            self.stats.matched_files += 1
+
+        if self.graph_builder and sr.entities:
+            try:
+                self.graph_builder.build_from_entities(sr.entities, sr.snippet, sr.path)
+            except Exception as e:
+                logger.debug(f"Graph build failed for {sr.path}: {e}")
+
+        self.emit(MessageType.MATCH, sr.to_dict())
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PYTHON API
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def search(self, query: str, folder: str,
+               options: Optional[SearchOptions] = None) -> Iterator[ScanResult]:
+        """Найти файлы по запросу (удобная обёртка над scan()).
+
+        Пример:
+            for match in engine.search("договор", "/data", SearchOptions(min_score=0.2)):
+                print(match.filename, match.score)
+        """
+        options = options or SearchOptions()
+        self.use_cache = options.use_index
+        self.fuzzy_search = options.use_fuzzy
+        self.use_morphology = options.use_morphology
+        self.use_nlp = options.extract_entities
+        if options.build_graph and self.graph_builder is None:
+            self.graph_builder = GraphBuilder()
+        elif not options.build_graph:
+            self.graph_builder = None
+
+        results = self.scan(folder, query, extensions=options.extensions,
+                            max_workers=options.max_workers)
+        count = 0
+        for r in results:
+            if r.score < options.min_score:
+                continue
+            yield r
+            count += 1
+            if options.max_results and count >= options.max_results:
+                break
+
     # ═══════════════════════════════════════════════════════════════════════════
     # UTILITIES
     # ═══════════════════════════════════════════════════════════════════════════
-    
+
+    def _collect_files(self, folder: Path, extensions: Set[str]) -> List[Path]:
+        """Collect files for scanning (совместимость)"""
+        return collect_files(folder, extensions,
+                             exclude_paths=list(ENGINE_CONFIG.exclude_paths) + self.exclude_paths,
+                             skip_hidden_dirs=ENGINE_CONFIG.skip_hidden_dirs,
+                             max_file_size=ENGINE_CONFIG.max_file_size,
+                             should_stop=self.is_stopped, stats=self.stats)
+
     def get_graph(self) -> Optional[Graph]:
         """Get built graph"""
         if self.graph_builder:
             return self.graph_builder.get_graph()
         return None
-    
+
     def get_stats(self) -> ScanStats:
         return self.stats
-    
+
     def get_results(self) -> List[ScanResult]:
         return self.results
 
@@ -779,113 +857,152 @@ class ScanEngine:
 class IncrementalIndexer:
     """
     Инкрементальный индексатор.
-    Обновляет индекс только для изменённых файлов.
+    Обновляет индекс только для изменённых файлов (параллельно).
     """
-    
-    def __init__(self, callback: Optional[Callable] = None):
+
+    def __init__(self, callback: Optional[Callable] = None, apply_limits: bool = True):
         self.callback = callback
+        self.apply_limits = apply_limits
         self.stats = ScanStats()
-        self._lock = threading.Lock()
-    
+        self._stop_event = threading.Event()
+
     def emit(self, msg_type: str, data: Dict) -> None:
-        if self.callback:
-            self.callback(msg_type, data)
-        else:
-            print(json.dumps({"type": msg_type, **data}, ensure_ascii=False), flush=True)
-    
+        try:
+            if self.callback:
+                self.callback(msg_type, data)
+            elif msg_type == MessageType.ERROR:
+                logger.warning(f"{data.get('msg', '')} [{data.get('file', '')}]")
+            elif msg_type == MessageType.STATUS:
+                logger.info(data.get('msg', ''))
+            else:
+                logger.debug(f"{msg_type}: {str(data)[:200]}")
+        except Exception as e:
+            logger.debug(f"Callback failed: {e}")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def is_stopped(self) -> bool:
+        return self._stop_event.is_set()
+
     def index_folder(
         self,
         folder: str,
         extensions: Optional[Set[str]] = None,
-        extract_entities: bool = True
+        extract_entities: bool = True,
+        max_workers: Optional[int] = None,
+        cleanup: bool = False,
     ) -> ScanStats:
         """
         Индексировать папку (без поиска).
-        Только извлечение текста и сущностей для кеширования.
+
+        Args:
+            cleanup: удалить из индекса записи о файлах этой папки,
+                     которых больше нет на диске
         """
-        folder_path = Path(folder).resolve()
-        
+        from .resource_guard import apply_resource_limits, calculate_safe_workers, affinity_target
+        from .workerpool import WorkerPool
+
+        self._stop_event.clear()
+        folder_path = Path(folder).expanduser().resolve()
+
         if extensions is None:
-            extensions = FILE_TYPES.all_supported
-        
+            ensure_plugins_loaded()
+            extensions = default_extensions()
+
         self.stats = ScanStats()
         self.stats.start_time = datetime.now()
-        
-        self.emit(MessageType.STATUS, {"msg": "Building index..."})
-        
-        # Collect files
-        files = []
-        for root, dirs, filenames in os.walk(folder_path):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
-            for filename in filenames:
-                ext = Path(filename).suffix.lower()
-                if ext in extensions:
-                    files.append(Path(root) / filename)
-        
+
+        self.emit(MessageType.STATUS, {"msg": f"Collecting files in {folder_path}..."})
+
+        files = collect_files(
+            folder_path, extensions, exclude_paths=ENGINE_CONFIG.exclude_paths,
+            skip_hidden_dirs=ENGINE_CONFIG.skip_hidden_dirs,
+            max_file_size=ENGINE_CONFIG.max_file_size,
+            should_stop=self.is_stopped, stats=self.stats,
+        )
         self.stats.total_files = len(files)
-        self.emit(MessageType.STATUS, {"msg": f"Files to index: {len(files)}"})
-        
-        # Process files (with resource limits)
-        try:
-            from .resource_guard import calculate_safe_workers, apply_resource_limits
-            apply_resource_limits()
-            max_workers = calculate_safe_workers()
-        except Exception:
-            cpu_count = os.cpu_count() or 4
-            max_workers = max(1, cpu_count)
 
-        self.emit(MessageType.STATUS, {"msg": f"Indexing with {max_workers} workers"})
+        if cleanup and not self.is_stopped():
+            existing = {str(fp.absolute()) for fp in files}
+            deleted = file_index.delete_missing_files(existing, scope=str(folder_path))
+            self.emit(MessageType.STATUS, {"msg": f"Removed {deleted} stale index entries"})
 
-        executor = ProcessPoolExecutor(max_workers=max_workers)
-        futures = {}
-        try:
-            for fp in files:
-                try:
-                    futures[executor.submit(_index_file_worker, str(fp), extract_entities)] = fp
-                except Exception:
-                    self.stats.errors += 1
-
-            for i, future in enumerate(as_completed(futures)):
-                try:
-                    cached, error = future.result(timeout=120)
-                    self.stats.processed_files += 1
-                    if cached:
-                        self.stats.cached += 1
-                    if error:
-                        self.stats.errors += 1
-
-                except Exception:
-                    self.stats.errors += 1
-
-                if i % 100 == 0:
-                    self.emit(MessageType.PROGRESS, {
-                        "current": self.stats.processed_files,
-                        "total": self.stats.total_files
-                    })
-        except Exception as pool_err:
-            self.emit(MessageType.ERROR, {
-                "msg": f"Index pool broken: {pool_err}"
-            })
-        finally:
+        cpu_affinity = affinity_target(ENGINE_CONFIG.max_cpu_percent)
+        if self.apply_limits:
             try:
-                executor.shutdown(wait=False, cancel_futures=True)
+                apply_resource_limits()
             except Exception:
                 pass
-        
+        per_worker = ENGINE_CONFIG.est_ram_per_worker_mb if extract_entities else max(
+            128, ENGINE_CONFIG.est_ram_per_worker_mb // 4)
+        max_workers = calculate_safe_workers(max_workers, per_worker_mb=per_worker)
+
+        self.emit(MessageType.STATUS, {
+            "msg": f"Files to index: {len(files)} (workers={min(max_workers, max(1, len(files)))})"})
+
+        if not files:
+            self.stats.end_time = datetime.now()
+            self.emit(MessageType.STATS, self.stats.to_dict())
+            return self.stats
+
+        _cleanup_stale_temp_dirs()
+
+        tasks = ((fp, (str(fp), extract_entities, ENGINE_CONFIG.max_extracted_chars)) for fp in files)
+        pool = WorkerPool(
+            _index_file_worker,
+            n_workers=min(max_workers, len(files)),
+            initializer=_worker_init,
+            initargs=(cpu_affinity, ENGINE_CONFIG.plugins_autoload),
+            task_timeout=ENGINE_CONFIG.file_timeout,
+            max_rss_mb=ENGINE_CONFIG.max_ram_per_worker_mb,
+        )
+        last_progress = 0.0
+        try:
+            for res in pool.run(tasks, should_stop=self.is_stopped):
+                self.stats.processed_files += 1
+                if not res.ok:
+                    self.stats.errors += 1
+                    if res.kind == 'timeout':
+                        self.stats.timeouts += 1
+                    self.emit(MessageType.ERROR, {"msg": res.error, "file": str(res.key)})
+                else:
+                    _path, status, error = res.value
+                    if status == 'cached':
+                        self.stats.cached += 1
+                    elif status == 'error':
+                        self.stats.errors += 1
+                        logger.debug(f"Index error for {_path}: {error}")
+                    elif status == 'indexed':
+                        self.stats.matched_files += 1  # здесь: число проиндексированных
+                    elif status == 'empty':
+                        self.stats.skipped += 1        # файл без текста (двоичные данные, пустой)
+
+                now = time.monotonic()
+                if now - last_progress >= 1.0 or self.stats.processed_files == self.stats.total_files:
+                    last_progress = now
+                    self.emit(MessageType.PROGRESS, {
+                        "current": self.stats.processed_files,
+                        "total": self.stats.total_files,
+                        "indexed": self.stats.matched_files,
+                        "cached": self.stats.cached,
+                        "skipped": self.stats.skipped,
+                        "errors": self.stats.errors,
+                    })
+        except Exception as pool_err:
+            self.emit(MessageType.ERROR, {"msg": f"Index pool failure: {pool_err}"})
+        finally:
+            pool.terminate()
+
         self.stats.end_time = datetime.now()
 
-        # Checkpoint WAL to reclaim disk space after bulk inserts
         try:
             file_index.checkpoint()
         except Exception:
             pass
 
         self.emit(MessageType.STATS, self.stats.to_dict())
-
         return self.stats
-    
-    # _index_file removed — replaced by top-level _index_file_worker()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -893,6 +1010,6 @@ class IncrementalIndexer:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 __all__ = [
-    'ScanEngine', 'ScanResult', 'ScanStats', 'MessageType',
-    'IncrementalIndexer'
+    'ScanEngine', 'ScanResult', 'ScanStats', 'SearchOptions', 'MessageType',
+    'IncrementalIndexer', 'collect_files', 'default_extensions', 'ensure_plugins_loaded',
 ]

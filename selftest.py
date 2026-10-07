@@ -5,12 +5,13 @@ ASTREX v3.0 — Self-Test Module
 """
 
 import sys
-import os
 import json
 import tempfile
-import shutil
 from pathlib import Path
 from datetime import datetime
+
+# Импорт модулей проекта независимо от текущего каталога
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 # Colors
@@ -68,7 +69,7 @@ def run_tests():
     
     # Config
     try:
-        from core.config import ASTREX_HOME, FILE_TYPES, ENGINE_CONFIG
+        from core.config import ASTREX_HOME, FILE_TYPES
         ok(f"config — Home: {ASTREX_HOME}")
         ok(f"config — File types: {len(FILE_TYPES.all_supported)} supported")
         results["tests"]["config"] = True
@@ -91,9 +92,9 @@ def run_tests():
         from core.nlp import morph_analyzer
         if morph_analyzer.available:
             forms = morph_analyzer.get_all_forms("договор")
-            ok(f"morphology — pymorphy2 ({len(forms)} forms)")
+            ok(f"morphology — {morph_analyzer.backend} ({len(forms)} forms)")
         else:
-            warn("morphology — pymorphy2 not available")
+            warn("morphology — pymorphy3/pymorphy2 not available (Snowball stemmer fallback)")
         results["tests"]["morphology"] = morph_analyzer.available
     except Exception as e:
         fail(f"morphology — {e}")
@@ -156,12 +157,15 @@ def run_tests():
         from core.graph import GraphBuilder, GraphAnalyzer
         builder = GraphBuilder()
         builder.build_from_entities(
-            {"PERSON": ["Иванов", "Петров"], "ORG": ["Газпром"]},
-            "Иванов и Петров работают в Газпром",
+            {"PERSONS": ["Иванов", "Петров"], "ORGANIZATIONS": ["ООО Газпром"]},
+            "Иванов и Петров работают в ООО Газпром",
             "/test/file.txt"
         )
         graph = builder.get_graph()
-        ok(f"graph — {len(graph.nodes)} nodes, {len(graph.edges)} edges")
+        stats = GraphAnalyzer(graph).get_statistics()
+        relations = sorted({e.relation for e in graph.edges})
+        ok(f"graph — {len(graph.nodes)} nodes, {len(graph.edges)} edges "
+           f"({', '.join(relations)}), density {stats['density']:.2f}")
         results["tests"]["graph"] = True
     except Exception as e:
         fail(f"graph — {e}")
@@ -280,7 +284,7 @@ def run_tests():
     # Tesseract
     try:
         import subprocess
-        result = subprocess.run(['tesseract', '--version'], capture_output=True, text=True)
+        result = subprocess.run(['tesseract', '--version'], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             version = result.stdout.split('\n')[0]
             ok(f"tesseract — {version}")
@@ -298,7 +302,7 @@ def run_tests():
     # libpst
     try:
         import subprocess
-        result = subprocess.run(['readpst', '-V'], capture_output=True, text=True)
+        result = subprocess.run(['readpst', '-V'], capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             ok("libpst — available")
             results["tests"]["libpst"] = True
@@ -309,6 +313,7 @@ def run_tests():
         warn("libpst — not installed")
         results["tests"]["libpst"] = False
     except Exception as e:
+        warn(f"libpst — {e}")
         results["tests"]["libpst"] = False
     
     # ═══════════════════════════════════════════════════════════════════════════
@@ -346,16 +351,17 @@ def run_tests():
                 test_file.write_text(f"Документ номер {i} содержит информацию о Газпроме", encoding='utf-8')
             
             from core.engine import ScanEngine
-            
-            engine = ScanEngine()
-            matches = list(engine.search("Газпром", tmpdir))
-            
+
+            # Без кеша (не засоряем индекс временными файлами) и без NLP (быстро)
+            engine = ScanEngine(use_cache=False, use_nlp=False, apply_limits=False)
+            matches = engine.scan(tmpdir, "Газпром", max_workers=1)
+
             if len(matches) == 5:
                 ok(f"search — Found {len(matches)} matches")
                 results["tests"]["search"] = True
             else:
-                warn(f"search — Found {len(matches)}/5 matches")
-                results["tests"]["search"] = True
+                fail(f"search — Found {len(matches)}/5 matches")
+                results["tests"]["search"] = False
     except Exception as e:
         fail(f"search — {e}")
         results["tests"]["search"] = False
@@ -365,8 +371,8 @@ def run_tests():
         with tempfile.TemporaryDirectory() as tmpdir:
             from core.index import FileIndex
             
-            test_index = FileIndex(Path(tmpdir) / "test.db")
-            
+            test_index = FileIndex(Path(tmpdir) / "test.db")  # отдельная временная база
+
             test_index.upsert_file(
                 path="/test/file.txt",
                 filename="file.txt",
@@ -378,7 +384,8 @@ def run_tests():
             )
             
             results_list = test_index.search_fts("ключевым", 10)
-            
+            test_index.close_all()
+
             if results_list and len(results_list) > 0:
                 ok("indexing — FTS search works")
                 results["tests"]["indexing"] = True

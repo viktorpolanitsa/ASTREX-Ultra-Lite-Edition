@@ -4,18 +4,23 @@ ASTREX v3.0 — Extractors Package
 Модули извлечения текста из различных форматов
 """
 
-from .base import BaseExtractor, ExtractionResult, ExtractorRegistry, registry
+import logging
+
+from .base import (BaseExtractor, ExtractionResult, ExtractorRegistry, registry,
+                   TextCollector, extract_nested_bytes)
 
 # Import all extractors to register them
 from .documents import (
     PDFExtractor, DOCXExtractor, XLSXExtractor, PPTXExtractor,
     ODTExtractor, LegacyOfficeExtractor, RTFExtractor, EPUBExtractor,
+    FB2Extractor, MOBIExtractor,
 )
 from .email import (
     EMLExtractor, MSGExtractor, MBOXExtractor, PSTExtractor,
 )
 from .archives import (
-    ZIPExtractor, TARExtractor, GZIPExtractor, RARExtractor, SevenZipExtractor,
+    ZIPExtractor, TARExtractor, CompressedFileExtractor, GZIPExtractor,
+    RARExtractor, SevenZipExtractor,
 )
 from .images import (
     ImageOCRExtractor, ScreenshotExtractor,
@@ -28,14 +33,14 @@ from .text import (
 )
 
 try:
-    from .media import *
-except ImportError:
-    pass
+    from .media import AudioExtractor, VideoExtractor
+except Exception as e:  # pragma: no cover
+    logging.getLogger("astrex.extractors").warning("Media extractors unavailable: %s", e)
 
 try:
-    from .network import *
-except ImportError:
-    pass
+    from .network import PcapExtractor, NetflowExtractor
+except Exception as e:  # pragma: no cover
+    logging.getLogger("astrex.extractors").warning("Network extractors unavailable: %s", e)
 
 
 def extract_text(path):
@@ -45,23 +50,24 @@ def extract_text(path):
 
 
 def list_supported_formats():
-    """List all supported file formats"""
-    extractors = registry.list_extractors()
-    
+    """List all supported file formats (extension → best available extractor)"""
     formats = {}
-    for ext in extractors:
+    for ext in registry.list_extractors():
         for extension in ext['extensions']:
-            if extension not in formats or ext['priority'] < formats[extension]['priority']:
+            current = formats.get(extension)
+            better = current is None or (ext['available'] and not current['available']) or (
+                ext['available'] == current['available'] and ext['priority'] < current['priority'])
+            if better:
                 formats[extension] = {
                     'extractor': ext['name'],
                     'priority': ext['priority'],
                     'available': ext['available']
                 }
-    
     return formats
 
 
 __all__ = [
     'BaseExtractor', 'ExtractionResult', 'ExtractorRegistry', 'registry',
+    'TextCollector', 'extract_nested_bytes',
     'extract_text', 'list_supported_formats'
 ]

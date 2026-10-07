@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Тесты модуля логирования"""
 
-import sys
+import io
 import logging
+import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import tests.helpers  # noqa: F401,E402
 
 
 class TestLogging(unittest.TestCase):
@@ -34,6 +36,28 @@ class TestLogging(unittest.TestCase):
         log.warning('Test warning')
         log.error('Test error')
         log.debug('Test debug')
+
+    def test_child_logger_has_no_own_handlers(self):
+        """Дочерние логгеры не получают своих обработчиков (иначе — дубли)."""
+        from core.logging_setup import get_logger
+        child = get_logger('astrex.cli_test')
+        self.assertEqual(child.handlers, [])
+        self.assertTrue(child.propagate)
+
+    def test_message_is_written_once(self):
+        """Регрессия: сообщение дочернего логгера выводилось дважды."""
+        from core.logging_setup import get_logger, log
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setLevel(logging.DEBUG)
+        log.addHandler(handler)
+        try:
+            get_logger('astrex.cli').error('единственное сообщение')
+        finally:
+            log.removeHandler(handler)
+        self.assertEqual(stream.getvalue().count('единственное сообщение'), 1)
+        # и корневой логгер Python его не дублирует
+        self.assertFalse(logging.getLogger('astrex').propagate)
 
 
 if __name__ == '__main__':

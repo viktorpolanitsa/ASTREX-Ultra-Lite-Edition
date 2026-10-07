@@ -1,10 +1,22 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════════
 # ASTREX v3.0 — Installation Script
 # Automated setup with hardware detection
+#
+#   ./install.sh                      интерактивно
+#   ./install.sh --yes --mode full    без вопросов (CI, ssh без терминала)
+#
+# Параметры:
+#   --mode minimal|standard|full|complete   (или 1-4; по умолчанию full)
+#   --gpu auto|cpu|nvidia|amd|intel         PyTorch для режима complete (по умолчанию auto)
+#   --yes, -y                               не задавать вопросов (ответы по умолчанию)
+#   --recreate-venv                         пересоздать venv/
+#   --build-gui                             собрать GUI (ui/build.sh), если есть Qt 6
+#   --python /path/to/python3               интерпретатор для venv
+# Переменные окружения: ASTREX_INSTALL_MODE, ASTREX_GPU, PYTHON.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-set -e
+set -eo pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -12,10 +24,47 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 BOLD='\033[1m'
 
-# Banner
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/venv"
+
+INSTALL_MODE="${ASTREX_INSTALL_MODE:-}"
+GPU_CHOICE="${ASTREX_GPU:-auto}"
+ASSUME_YES=0
+RECREATE_VENV=0
+BUILD_GUI=0
+PYTHON_BIN="${PYTHON:-}"
+FAILED_OPTIONAL=()
+
+usage() {
+    # Комментарий в начале файла (до первой строки кода)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mode) INSTALL_MODE="${2:-}"; shift 2 ;;
+        --mode=*) INSTALL_MODE="${1#*=}"; shift ;;
+        --gpu) GPU_CHOICE="${2:-auto}"; shift 2 ;;
+        --gpu=*) GPU_CHOICE="${1#*=}"; shift ;;
+        --python) PYTHON_BIN="${2:-}"; shift 2 ;;
+        --python=*) PYTHON_BIN="${1#*=}"; shift ;;
+        -y|--yes) ASSUME_YES=1; shift ;;
+        --recreate-venv) RECREATE_VENV=1; shift ;;
+        --build-gui) BUILD_GUI=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+    esac
+done
+
+# Без терминала (curl | bash, ssh без -t, CI) вопросы не задаются: раньше
+# "read" при set -e обрывал установку на первом же вопросе
+if [ ! -t 0 ]; then
+    ASSUME_YES=1
+fi
+
 echo -e "${CYAN}"
 echo "╔═══════════════════════════════════════════════════════════════════════════════╗"
 echo "║                                                                               ║"
@@ -34,24 +83,47 @@ echo -e "${NC}"
 # FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-log_step() {
-    echo -e "\n${BLUE}${BOLD}=== $1 ===${NC}\n"
-}
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+log_step()  { echo -e "\n${BLUE}${BOLD}=== $1 ===${NC}\n"; }
 
 check_command() {
     command -v "$1" >/dev/null 2>&1
+}
+
+# ask "вопрос" "ответ по умолчанию" → ответ в $REPLY
+ask() {
+    local prompt="$1" default="$2"
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        REPLY="$default"
+        echo "$prompt $default (auto)"
+        return 0
+    fi
+    read -r -p "$prompt " REPLY || REPLY=""
+    REPLY="${REPLY:-$default}"
+}
+
+# Обязательные пакеты: при ошибке установка прерывается
+pip_required() {
+    log_info "pip install $*"
+    if ! "$VENV_PY" -m pip install -q "$@"; then
+        log_error "Failed to install required packages: $*"
+        exit 1
+    fi
+}
+
+# Необязательные пакеты: ошибка не прерывает установку
+pip_optional() {
+    local label="$1"
+    shift
+    log_info "pip install $* ($label)"
+    if ! "$VENV_PY" -m pip install -q "$@"; then
+        log_warn "Could not install $label — the related features will be disabled"
+        FAILED_OPTIONAL+=("$label")
+        return 1
+    fi
+    return 0
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -60,55 +132,42 @@ check_command() {
 
 log_step "Step 1/7: System Check"
 
-# Check Python
-if ! check_command python3; then
-    log_error "Python 3 not found. Please install Python 3.11 or 3.12"
+if [ -z "$PYTHON_BIN" ]; then
+    PYTHON_BIN="$(command -v python3 || true)"
+fi
+if [ -z "$PYTHON_BIN" ] || ! "$PYTHON_BIN" -c 'import sys' >/dev/null 2>&1; then
+    log_error "Python 3 not found. Install Python 3.10–3.13 (e.g. sudo apt install python3 python3-venv)"
     exit 1
 fi
 
-PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-PYTHON_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)')
-PYTHON_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
+PYTHON_VERSION=$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+PYTHON_MINOR=$("$PYTHON_BIN" -c 'import sys; print(sys.version_info[1])')
+PYTHON_MAJOR=$("$PYTHON_BIN" -c 'import sys; print(sys.version_info[0])')
+log_info "Python: $PYTHON_BIN ($PYTHON_VERSION)"
 
-log_info "Python version: $PYTHON_VERSION"
-
-# Check Python version compatibility
-PYTHON_COMPAT="full"
-if [[ "$PYTHON_MAJOR" -eq 3 && "$PYTHON_MINOR" -ge 14 ]]; then
-    echo ""
-    echo -e "${YELLOW}╔════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${YELLOW}║  WARNING: Python $PYTHON_VERSION detected                                   ║${NC}"
-    echo -e "${YELLOW}║                                                                    ║${NC}"
-    echo -e "${YELLOW}║  spaCy is not compatible with Python 3.14+                        ║${NC}"
-    echo -e "${YELLOW}║  Some NLP features will be disabled (regex-only mode)             ║${NC}"
-    echo -e "${YELLOW}║                                                                    ║${NC}"
-    echo -e "${YELLOW}║  For full functionality, use Python 3.11 or 3.12:                 ║${NC}"
-    echo -e "${YELLOW}║    pyenv install 3.12.0 && pyenv local 3.12.0                     ║${NC}"
-    echo -e "${YELLOW}╚════════════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    PYTHON_COMPAT="limited"
-    
-    read -p "Continue with limited functionality? [y/N]: " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        log_info "Installation cancelled."
-        exit 0
-    fi
+if [ "$PYTHON_MAJOR" -ne 3 ] || [ "$PYTHON_MINOR" -lt 10 ]; then
+    log_error "Python $PYTHON_VERSION is too old: ASTREX requires Python 3.10 or newer"
+    exit 1
+fi
+if [ "$PYTHON_MINOR" -ge 14 ]; then
+    log_warn "Python $PYTHON_VERSION: spaCy and some ML packages may not have wheels yet."
+    log_warn "If their installation fails, ASTREX works without them (regex NLP)."
 fi
 
-# Check pip
-if ! check_command pip3; then
-    log_error "pip3 not found. Please install pip."
+if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1 || ! "$PYTHON_BIN" -c 'import ensurepip' >/dev/null 2>&1; then
+    log_error "The venv module is not available for $PYTHON_BIN."
+    echo "  Debian/Ubuntu/Kali: sudo apt install python3-venv"
+    echo "  Fedora:             sudo dnf install python3-virtualenv"
     exit 1
 fi
 
-# OS detection
 OS="unknown"
 if [[ "$OSTYPE" == "linux-gnu"* ]]; then
     OS="linux"
     if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
         . /etc/os-release
-        log_info "OS: $NAME"
+        log_info "OS: ${PRETTY_NAME:-$NAME}"
     fi
 elif [[ "$OSTYPE" == "darwin"* ]]; then
     OS="macos"
@@ -117,6 +176,10 @@ else
     OS="other"
     log_info "OS: $OSTYPE"
 fi
+
+# Права могли потеряться при распаковке zip-архива
+chmod +x "$SCRIPT_DIR/astrex.py" "$SCRIPT_DIR/install.sh" "$SCRIPT_DIR/ui/build.sh" 2>/dev/null || true
+[ -f "$SCRIPT_DIR/ui/Astrex" ] && chmod +x "$SCRIPT_DIR/ui/Astrex" 2>/dev/null || true
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 2: HARDWARE DETECTION
@@ -127,50 +190,48 @@ log_step "Step 2/7: Hardware Detection"
 GPU_TYPE="cpu"
 GPU_NAME=""
 
-# Check for NVIDIA GPU
 if check_command nvidia-smi; then
-    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
     if [ -n "$GPU_NAME" ]; then
         GPU_TYPE="nvidia"
         log_info "NVIDIA GPU detected: $GPU_NAME"
     fi
 fi
 
-# Check for Intel GPU
-if [ "$GPU_TYPE" == "cpu" ]; then
-    if [ -d "/sys/class/drm" ]; then
-        for card in /sys/class/drm/card*/device/vendor; do
-            if [ -f "$card" ]; then
-                vendor=$(cat "$card" 2>/dev/null)
-                if [ "$vendor" == "0x8086" ]; then
-                    GPU_TYPE="intel"
-                    # Try to get GPU name
-                    if check_command lspci; then
-                        GPU_NAME=$(lspci | grep -i "VGA\|Display" | grep -i intel | head -1 | sed 's/.*: //')
-                    fi
-                    log_info "Intel GPU detected: ${GPU_NAME:-Intel Graphics}"
-                    break
-                fi
+if [ "$GPU_TYPE" = "cpu" ] && { check_command rocm-smi || [ -e /dev/kfd ]; }; then
+    for vendor_file in /sys/class/drm/card[0-9]*/device/vendor; do
+        [ -f "$vendor_file" ] || continue
+        if [ "$(cat "$vendor_file" 2>/dev/null)" = "0x1002" ]; then
+            GPU_TYPE="amd"
+            log_info "AMD GPU detected (ROCm)"
+            break
+        fi
+    done
+fi
+
+if [ "$GPU_TYPE" = "cpu" ]; then
+    for vendor_file in /sys/class/drm/card[0-9]*/device/vendor; do
+        [ -f "$vendor_file" ] || continue
+        if [ "$(cat "$vendor_file" 2>/dev/null)" = "0x8086" ]; then
+            GPU_TYPE="intel"
+            if check_command lspci; then
+                GPU_NAME=$(lspci | grep -iE "VGA|Display" | grep -i intel | head -1 | sed 's/.*: //' || true)
             fi
-        done
-    fi
+            log_info "Intel GPU detected: ${GPU_NAME:-Intel Graphics}"
+            break
+        fi
+    done
 fi
 
-# Check for AMD GPU
-if [ "$GPU_TYPE" == "cpu" ]; then
-    if check_command rocm-smi; then
-        GPU_TYPE="amd"
-        log_info "AMD GPU detected (ROCm)"
-    fi
-fi
-
-# CPU info
 CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "4")
 log_info "CPU cores: $CPU_CORES"
+[ "$GPU_TYPE" = "cpu" ] && log_info "No GPU detected — CPU-only mode"
 
-if [ "$GPU_TYPE" == "cpu" ]; then
-    log_info "No GPU detected - CPU-only mode"
-fi
+case "$GPU_CHOICE" in
+    auto|"") ;;
+    cpu|nvidia|amd|intel) GPU_TYPE="$GPU_CHOICE"; log_info "GPU backend forced: $GPU_TYPE" ;;
+    *) log_error "Unknown --gpu value: $GPU_CHOICE"; exit 2 ;;
+esac
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 3: MODE SELECTION
@@ -178,30 +239,25 @@ fi
 
 log_step "Step 3/7: Installation Mode"
 
-echo "Select installation mode:"
-echo ""
-echo "  1) Minimal   - Core scanning, basic NLP (fastest install)"
-echo "  2) Standard  - + spaCy, morphology, fuzzy search"
-echo "  3) Full      - + sentence-transformers, vector DB, web API"
-echo "  4) Complete  - + GPU acceleration, local LLM support"
-echo ""
-
-if [ "$PYTHON_COMPAT" == "limited" ]; then
-    echo -e "${YELLOW}Note: spaCy unavailable on Python 3.14+${NC}"
+if [ -z "$INSTALL_MODE" ]; then
+    echo "Select installation mode:"
     echo ""
+    echo "  1) Minimal   - Core scanning, all document formats, regex NLP"
+    echo "  2) Standard  - + Russian morphology (pymorphy3), fuzzy search, spaCy"
+    echo "  3) Full      - + sentence-transformers, vector DB (RAG), web API, media/network formats"
+    echo "  4) Complete  - + PyTorch for your GPU, OpenVINO / Whisper"
+    echo ""
+    ask "Enter choice [1-4, default=3]:" "3"
+    INSTALL_MODE="$REPLY"
 fi
 
-read -p "Enter choice [1-4, default=3]: " MODE_CHOICE
-MODE_CHOICE=${MODE_CHOICE:-3}
-
-case $MODE_CHOICE in
-    1) INSTALL_MODE="minimal" ;;
-    2) INSTALL_MODE="standard" ;;
-    3) INSTALL_MODE="full" ;;
-    4) INSTALL_MODE="complete" ;;
-    *) INSTALL_MODE="full" ;;
+case "$INSTALL_MODE" in
+    1|minimal)  INSTALL_MODE="minimal" ;;
+    2|standard) INSTALL_MODE="standard" ;;
+    3|full)     INSTALL_MODE="full" ;;
+    4|complete) INSTALL_MODE="complete" ;;
+    *) log_warn "Unknown mode '$INSTALL_MODE' — using full"; INSTALL_MODE="full" ;;
 esac
-
 log_info "Selected mode: $INSTALL_MODE"
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -210,30 +266,28 @@ log_info "Selected mode: $INSTALL_MODE"
 
 log_step "Step 4/7: Python Environment"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="$SCRIPT_DIR/venv"
-
 if [ -d "$VENV_DIR" ]; then
     log_info "Virtual environment exists at $VENV_DIR"
-    read -p "Recreate virtual environment? [y/N]: " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        rm -rf "$VENV_DIR"
-        python3 -m venv "$VENV_DIR"
-        log_info "Virtual environment recreated"
+    if [ "$RECREATE_VENV" -eq 0 ]; then
+        ask "Recreate virtual environment? [y/N]:" "n"
+        [[ "$REPLY" =~ ^[Yy]$ ]] && RECREATE_VENV=1
     fi
-else
-    python3 -m venv "$VENV_DIR"
+    if [ "$RECREATE_VENV" -eq 1 ]; then
+        rm -rf "$VENV_DIR"
+    fi
+fi
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
     log_info "Virtual environment created at $VENV_DIR"
 fi
 
-# Activate venv
-source "$VENV_DIR/bin/activate"
-log_info "Virtual environment activated"
-
-# Upgrade pip
-pip install --upgrade pip wheel setuptools -q
-log_info "pip upgraded"
+# Всё ставится интерпретатором venv напрямую (GUI находит venv/ сам)
+VENV_PY="$VENV_DIR/bin/python"
+if "$VENV_PY" -m pip install -q --upgrade pip wheel setuptools; then
+    log_info "pip upgraded"
+else
+    log_warn "Could not upgrade pip (offline?) — continuing with the bundled version"
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 5: INSTALL DEPENDENCIES
@@ -241,106 +295,117 @@ log_info "pip upgraded"
 
 log_step "Step 5/7: Installing Dependencies"
 
-# Core (always)
-log_info "Installing core dependencies..."
-pip install pypdf chardet -q
-
-# Extractors
-log_info "Installing extractors..."
-pip install olefile striprtf extract-msg rarfile py7zr beautifulsoup4 lxml -q
+# Ядро и форматы документов (Minimal)
+pip_required "pypdf>=3.0.0" "chardet>=5.0.0" "pyyaml>=6.0"
+pip_optional "document formats" "olefile>=0.46" "xlrd>=2.0.1" "openpyxl>=3.1" "striprtf>=0.0.26" \
+    "extract-msg>=0.45.0" "rarfile>=4.0" "py7zr>=0.20.0" "beautifulsoup4>=4.12.0" "lxml>=4.9.0" \
+    "Pillow>=10.0" "numpy>=1.24" "zstandard>=0.21" "lz4>=4.0" || true
 
 if [ "$INSTALL_MODE" != "minimal" ]; then
-    # NLP
-    log_info "Installing NLP dependencies..."
-    pip install pymorphy2 pymorphy2-dicts-ru rapidfuzz -q
-    
-    # spaCy (only if Python < 3.14)
-    if [ "$PYTHON_COMPAT" == "full" ]; then
-        log_info "Installing spaCy..."
-        pip install spacy -q
-        
-        log_info "Downloading Russian language model..."
-        python -m spacy download ru_core_news_sm -q || log_warn "Failed to download spaCy model"
-    else
-        log_warn "Skipping spaCy (Python 3.14+ not supported)"
+    # pymorphy3 — pymorphy2 не работает на Python 3.11+ (inspect.getargspec удалён)
+    pip_optional "Russian morphology" "pymorphy3>=2.0" "pymorphy3-dicts-ru" || true
+    pip_optional "fuzzy search" "rapidfuzz>=3.0.0" || true
+    if pip_optional "spaCy" "spacy>=3.5.0"; then
+        log_info "Downloading Russian spaCy model..."
+        "$VENV_PY" -m spacy download ru_core_news_sm -q || {
+            log_warn "Failed to download the spaCy model ru_core_news_sm (regex NER will be used)"
+            FAILED_OPTIONAL+=("spaCy model")
+        }
     fi
 fi
 
-if [ "$INSTALL_MODE" == "full" ] || [ "$INSTALL_MODE" == "complete" ]; then
-    # Sentence transformers
-    log_info "Installing sentence-transformers..."
-    pip install sentence-transformers -q
-    
-    # Vector DB
-    log_info "Installing vector database..."
-    pip install chromadb -q
-    
-    # Web API
-    log_info "Installing web API dependencies..."
-    pip install fastapi uvicorn -q
+if [ "$INSTALL_MODE" = "full" ] || [ "$INSTALL_MODE" = "complete" ]; then
+    # Без GPU — CPU-сборка PyTorch (иначе sentence-transformers скачает CUDA-версию на ~2 ГБ)
+    if [ "$INSTALL_MODE" = "full" ] && [ "$GPU_TYPE" = "cpu" ] && [ "$OS" = "linux" ]; then
+        pip_optional "PyTorch (CPU)" torch --index-url https://download.pytorch.org/whl/cpu || true
+    fi
+    pip_optional "semantic relevance" "sentence-transformers>=2.2.0" || true
+    pip_optional "vector database (RAG)" "chromadb>=0.4.0" || true
+    pip_optional "web API" "fastapi>=0.100.0" "uvicorn>=0.23.0" || true
+    pip_optional "media metadata" "mutagen>=1.47" || true
+    pip_optional "network captures" "scapy>=2.5" || true
+    pip_optional "PDF reports" "weasyprint>=60" || true
+    pip_optional "PST mailboxes (pypff)" "libpff-python" || true
 fi
 
-if [ "$INSTALL_MODE" == "complete" ]; then
-    # GPU-specific installations
-    log_info "Installing GPU acceleration..."
-    
-    case $GPU_TYPE in
+if [ "$INSTALL_MODE" = "complete" ]; then
+    log_info "Installing GPU acceleration for: $GPU_TYPE"
+    case "$GPU_TYPE" in
         nvidia)
-            log_info "Installing CUDA support..."
-            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 -q || \
-            pip install torch -q
-            ;;
-        intel)
-            log_info "Installing Intel GPU support..."
-            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu -q
-            pip install intel-extension-for-pytorch -q 2>/dev/null || log_warn "IPEX not available"
-            pip install openvino openvino-dev -q 2>/dev/null || log_warn "OpenVINO installation failed"
+            # Колёса PyTorch с PyPI для Linux уже включают CUDA
+            pip_optional "PyTorch (CUDA)" torch || true
             ;;
         amd)
-            log_info "Installing AMD ROCm support..."
-            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.6 -q || \
-            pip install torch -q
+            installed=0
+            for rocm in rocm6.4 rocm6.3 rocm6.2; do
+                if "$VENV_PY" -m pip install -q torch --index-url "https://download.pytorch.org/whl/$rocm"; then
+                    log_info "PyTorch for ROCm installed ($rocm)"
+                    installed=1
+                    break
+                fi
+            done
+            if [ "$installed" -eq 0 ]; then
+                log_warn "PyTorch for ROCm not available — installing the CPU build"
+                pip_optional "PyTorch (CPU)" torch --index-url https://download.pytorch.org/whl/cpu || true
+            fi
+            ;;
+        intel)
+            # PyTorch ≥ 2.5 поддерживает Intel GPU (XPU) без IPEX
+            pip_optional "PyTorch (Intel XPU)" torch --index-url https://download.pytorch.org/whl/xpu || \
+                pip_optional "PyTorch (CPU)" torch --index-url https://download.pytorch.org/whl/cpu || true
+            pip_optional "OpenVINO" "openvino>=2024.0" || true
             ;;
         *)
-            log_info "Installing CPU PyTorch..."
-            pip install torch -q
+            pip_optional "PyTorch (CPU)" torch --index-url https://download.pytorch.org/whl/cpu || true
             ;;
     esac
+    pip_optional "audio/video transcription (Whisper)" openai-whisper || true
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 6: SYSTEM DEPENDENCIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-log_step "Step 6/7: System Dependencies"
+log_step "Step 6/7: System Dependencies (optional tools)"
 
-# Tesseract OCR
+APT_PKGS=()
+check_tool() {
+    # check_tool <команда> <описание> <пакет apt>
+    if check_command "$1"; then
+        log_info "$2: $(command -v "$1")"
+    else
+        log_warn "$2: not found (sudo apt install $3)"
+        APT_PKGS+=("$3")
+    fi
+}
+
 if check_command tesseract; then
-    TESSERACT_VERSION=$(tesseract --version 2>&1 | head -1)
-    log_info "Tesseract OCR: $TESSERACT_VERSION"
-else
-    log_warn "Tesseract OCR not found. OCR features will be disabled."
-    echo "  Install with:"
-    if [ "$OS" == "linux" ]; then
-        echo "    sudo apt install tesseract-ocr tesseract-ocr-rus"
-        echo "  or"
-        echo "    sudo pacman -S tesseract tesseract-data-rus"
-    elif [ "$OS" == "macos" ]; then
-        echo "    brew install tesseract tesseract-lang"
+    if tesseract --list-langs 2>/dev/null | grep -qx rus; then
+        log_info "OCR: tesseract with Russian language"
+    else
+        log_warn "OCR: tesseract without Russian language data (sudo apt install tesseract-ocr-rus)"
+        APT_PKGS+=("tesseract-ocr-rus")
     fi
+else
+    log_warn "OCR (images, scanned PDF): tesseract not found (sudo apt install tesseract-ocr tesseract-ocr-rus)"
+    APT_PKGS+=("tesseract-ocr" "tesseract-ocr-rus")
 fi
-
-# libpst for PST files
-if check_command readpst; then
-    log_info "libpst: available"
+if check_command unrar || check_command unar || check_command bsdtar; then
+    log_info "RAR archives: $(command -v unrar || command -v unar || command -v bsdtar)"
 else
-    log_warn "libpst not found. PST file support limited."
-    echo "  Install with:"
-    if [ "$OS" == "linux" ]; then
-        echo "    sudo apt install pst-utils"
-    elif [ "$OS" == "macos" ]; then
-        echo "    brew install libpst"
-    fi
+    log_warn "RAR archives: unrar/unar not found (sudo apt install unar)"
+    APT_PKGS+=("unar")
+fi
+check_tool readpst "PST mailboxes" "pst-utils"
+check_tool mdb-export "MS Access databases" "mdbtools"
+check_tool ffprobe "Audio/video metadata and transcription" "ffmpeg"
+check_tool pg_restore "PostgreSQL custom dumps" "postgresql-client"
+check_tool nfdump "NetFlow captures" "nfdump"
+
+if [ ${#APT_PKGS[@]} -gt 0 ] && [ "$OS" = "linux" ]; then
+    echo ""
+    echo "  All missing tools at once (Debian/Ubuntu/Kali):"
+    echo "    sudo apt install ${APT_PKGS[*]}"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -349,106 +414,34 @@ fi
 
 log_step "Step 7/7: Verification"
 
-log_info "Running self-test..."
-
-# Create test script
-TEST_SCRIPT=$(cat <<'EOF'
-import sys
-import warnings
-warnings.filterwarnings('ignore')
-
-print(f"Python: {sys.version}")
-print()
-
-# Core
-print("Core modules:")
-try:
-    from core.config import ASTREX_HOME
-    print(f"  ✓ config (home: {ASTREX_HOME})")
-except Exception as e:
-    print(f"  ✗ config: {e}")
-
-try:
-    from core.index import file_index
-    stats = file_index.get_stats()
-    print(f"  ✓ index ({stats['total_files']} files)")
-except Exception as e:
-    print(f"  ✗ index: {e}")
-
-# NLP
-print("\nNLP modules:")
-try:
-    from core.nlp import morph_analyzer
-    print(f"  {'✓' if morph_analyzer.available else '✗'} morphology (pymorphy2)")
-except Exception as e:
-    print(f"  ✗ morphology: {e}")
-
-try:
-    from core.nlp import entity_extractor
-    print(f"  {'✓' if entity_extractor.nlp else '✗'} spaCy")
-except Exception as e:
-    print(f"  ✗ spaCy: {e}")
-
-try:
-    from core.nlp import relevance_calculator
-    print(f"  {'✓' if relevance_calculator.sbert_model else '✗'} sentence-transformers")
-except Exception as e:
-    print(f"  ✗ sentence-transformers: {e}")
-
-try:
-    from core.nlp import FuzzyMatcher
-    print(f"  {'✓' if FuzzyMatcher.is_available() else '✗'} fuzzy search (rapidfuzz)")
-except Exception as e:
-    print(f"  ✗ fuzzy search: {e}")
-
-# Extractors
-print("\nExtractors:")
-try:
-    from extractors import registry
-    extractors = registry.list_extractors()
-    available = sum(1 for e in extractors if e['available'])
-    print(f"  ✓ {available}/{len(extractors)} extractors available")
-except Exception as e:
-    print(f"  ✗ extractors: {e}")
-
-# ML
-print("\nML modules:")
-try:
-    from ml import vector_store
-    vs_stats = vector_store.get_stats()
-    print(f"  {'✓' if vs_stats.get('available') else '✗'} vector store")
-except Exception as e:
-    print(f"  ✗ vector store: {e}")
-
-try:
-    from ml import get_llm_status
-    llm = get_llm_status()
-    print(f"  {'✓' if llm.get('available') else '✗'} LLM (Ollama)")
-except Exception as e:
-    print(f"  ✗ LLM: {e}")
-
-# GPU
-print("\nGPU:")
-try:
-    import torch
-    if torch.cuda.is_available():
-        print(f"  ✓ CUDA: {torch.cuda.get_device_name(0)}")
-    elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-        print(f"  ✓ Intel XPU available")
-    else:
-        print("  ○ CPU mode")
-except ImportError:
-    print("  ○ PyTorch not installed")
-except Exception as e:
-    print(f"  ✗ GPU: {e}")
-
-print("\n" + "="*50)
-print("Installation complete!")
-EOF
-)
-
 cd "$SCRIPT_DIR"
-python3 -c "$TEST_SCRIPT" || log_warn "Some components may not be fully functional"
+SELFTEST_OK=1
+"$VENV_PY" selftest.py || SELFTEST_OK=0
+
+# GUI: готовый бинарник собран с Qt 6.10; на системах со старым Qt его нужно пересобрать
+GUI_STATUS="not checked"
+if [ -f "$SCRIPT_DIR/ui/Astrex" ] && check_command ldd; then
+    LDD_OUT="$(ldd "$SCRIPT_DIR/ui/Astrex" 2>&1 || true)"
+    if echo "$LDD_OUT" | grep -qE "not found"; then
+        GUI_STATUS="needs rebuild"
+        log_warn "Prebuilt GUI does not run here (Qt 6 missing or older than 6.10):"
+        echo "$LDD_OUT" | grep "not found" | sed 's/^/    /'
+        if [ "$BUILD_GUI" -eq 0 ]; then
+            ask "Build the GUI from source now (needs qt6-base-dev)? [y/N]:" "n"
+            [[ "$REPLY" =~ ^[Yy]$ ]] && BUILD_GUI=1
+        fi
+    else
+        GUI_STATUS="ok"
+    fi
+fi
+if [ "$BUILD_GUI" -eq 1 ]; then
+    if "$SCRIPT_DIR/ui/build.sh"; then
+        GUI_STATUS="built"
+    else
+        GUI_STATUS="build failed"
+        log_warn "GUI build failed. Install a compiler and Qt 6: sudo apt install build-essential qt6-base-dev"
+    fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # DONE
@@ -459,23 +452,23 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║                      ASTREX v3.0 Installation Complete                        ║${NC}"
 echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
+if [ ${#FAILED_OPTIONAL[@]} -gt 0 ]; then
+    log_warn "Not installed (optional): ${FAILED_OPTIONAL[*]}"
+fi
+[ "$SELFTEST_OK" -eq 1 ] || log_warn "Self-test reported problems — see the output above"
+echo ""
 echo "Usage:"
 echo "  source venv/bin/activate"
 echo ""
 echo "  # CLI"
 echo "  python astrex.py scan \"query\" /path/to/folder"
+echo "  python astrex.py index /path/to/folder"
 echo "  python astrex.py search \"query\""
 echo "  python astrex.py status"
 echo ""
-echo "  # Web API"
-echo "  python -m web.api"
+echo "  # Web API (token is printed at startup; header 'Authorization: Bearer <token>')"
+echo "  python astrex.py web"
 echo ""
-echo "  # GUI (requires Qt6)"
-echo "  cd ui && qmake6 && make && ./Astrex"
+echo "  # GUI ($GUI_STATUS) — uses venv/ automatically"
+echo "  ./ui/Astrex            (rebuild for your Qt: ./ui/build.sh)"
 echo ""
-
-if [ "$PYTHON_COMPAT" == "limited" ]; then
-    echo -e "${YELLOW}Note: Running in limited mode (Python 3.14+)${NC}"
-    echo -e "${YELLOW}For full functionality, use Python 3.11 or 3.12${NC}"
-    echo ""
-fi
